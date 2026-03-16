@@ -1,0 +1,40 @@
+# Enterprise facilitator configuration.
+# All sections are optional — defaults are permissive for backwards compatibility.
+
+[rate_limiting]
+enabled = true
+requests_per_second = 10
+ban_duration_seconds = 300
+ban_threshold = 5
+# whitelisted_ips = ["127.0.0.0/8", "::1/128"]
+
+[cors]
+# Empty = allow all origins
+allowed_origins = []
+
+[ip_filtering]
+# Empty = allow all
+allowed_ips = []
+blocked_ips = []
+
+[request]
+max_body_size_bytes = 1048576  # 1MB
+
+[security]
+health_endpoint_requires_auth = false
+log_security_events = true
+cleanup_interval_seconds = 300
+
+[batch_settlement]
+enabled = false
+max_batch_size = 150
+max_wait_ms = 500
+min_batch_size = 10
+allow_partial_failure = false
+allow_hook_failure = false
+
+# Per-network overrides:
+# [batch_settlement.networks.base]
+# enabled = true
+# max_wait_ms = 250
+# min_batch_size = 5

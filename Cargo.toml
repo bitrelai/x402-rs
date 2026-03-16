@@ -9,6 +9,7 @@ members = [
   "crates/chains/x402-chain-solana",
   "crates/chains/x402-chain-aptos",
   "facilitator",
+  "facilitator-enterprise",
   "examples/x402-axum-example",
   "examples/x402-reqwest-example",
 ]

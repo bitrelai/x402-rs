@@ -1,0 +1,168 @@
+use alloy::primitives::Address;
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+use super::config::{TokenConfig, TokenDefinition, TokenSettings};
+
+#[derive(Debug, Clone)]
+pub struct TokenManager {
+    config_path: String,
+    state: Arc<RwLock<TokenState>>,
+}
+
+#[derive(Debug, Clone)]
+struct TokenState {
+    settings: TokenSettings,
+    address_cache: HashMap<String, HashMap<Address, String>>,
+}
+
+impl TokenManager {
+    pub fn new(config_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let config = TokenConfig::from_file(config_path)?;
+
+        let mut address_cache = HashMap::new();
+
+        for (network_name, network_tokens) in &config.tokens.networks {
+            if network_name == "solana" || network_name == "solana-devnet" {
+                continue;
+            }
+
+            let mut network_cache = HashMap::new();
+
+            for (token_name, address_str) in &network_tokens.tokens {
+                if let Ok(addr) = Address::from_str(address_str) {
+                    network_cache.insert(addr, token_name.clone());
+                } else {
+                    tracing::warn!(
+                        address = address_str,
+                        token = token_name,
+                        network = network_name,
+                        "Invalid address format in token configuration"
+                    );
+                }
+            }
+
+            address_cache.insert(network_name.clone(), network_cache);
+        }
+
+        let state = TokenState {
+            settings: config.tokens,
+            address_cache,
+        };
+
+        tracing::info!(
+            path = config_path,
+            definitions = state.settings.definitions.len(),
+            networks = state.settings.networks.len(),
+            "Initialized TokenManager"
+        );
+
+        Ok(Self {
+            config_path: config_path.to_string(),
+            state: Arc::new(RwLock::new(state)),
+        })
+    }
+
+    pub async fn get_token_name(&self, address: Address, network: &str) -> Option<String> {
+        let state = self.state.read().await;
+
+        state
+            .address_cache
+            .get(network)
+            .and_then(|cache| cache.get(&address))
+            .cloned()
+    }
+
+    pub async fn get_token_definition(&self, token_name: &str) -> Option<TokenDefinition> {
+        let state = self.state.read().await;
+        state.settings.definitions.get(token_name).cloned()
+    }
+
+    pub async fn get_token_address(&self, token_name: &str, network: &str) -> Option<Address> {
+        let state = self.state.read().await;
+
+        let network_tokens = state.settings.networks.get(network)?;
+
+        if let Some(address_str) = network_tokens.tokens.get(token_name) {
+            return Address::from_str(address_str).ok();
+        }
+
+        None
+    }
+
+    pub async fn get_abi_file(&self, token_name: &str) -> Option<String> {
+        let state = self.state.read().await;
+        state
+            .settings
+            .definitions
+            .get(token_name)
+            .map(|def| def.abi_file.clone())
+    }
+
+    pub async fn get_signature_format(
+        &self,
+        token_name: &str,
+    ) -> Option<super::config::SignatureFormat> {
+        let state = self.state.read().await;
+        state
+            .settings
+            .definitions
+            .get(token_name)
+            .map(|def| def.signature_format)
+    }
+
+    pub async fn reload(&self) -> Result<(), String> {
+        let config = TokenConfig::from_file(&self.config_path).map_err(|e| e.to_string())?;
+
+        let mut address_cache = HashMap::new();
+
+        for (network_name, network_tokens) in &config.tokens.networks {
+            let mut network_cache = HashMap::new();
+
+            for (token_name, address_str) in &network_tokens.tokens {
+                if let Ok(addr) = Address::from_str(address_str) {
+                    network_cache.insert(addr, token_name.clone());
+                }
+            }
+
+            address_cache.insert(network_name.clone(), network_cache);
+        }
+
+        let new_state = TokenState {
+            settings: config.tokens,
+            address_cache,
+        };
+
+        let mut state = self.state.write().await;
+        *state = new_state.clone();
+
+        tracing::info!(
+            definitions = new_state.settings.definitions.len(),
+            networks = new_state.settings.networks.len(),
+            "Reloaded TokenManager configuration"
+        );
+
+        Ok(())
+    }
+
+    pub async fn has_token(&self, token_name: &str, network: &str) -> bool {
+        self.get_token_address(token_name, network).await.is_some()
+    }
+
+    pub async fn get_network_tokens(&self, network: &str) -> Vec<String> {
+        let state = self.state.read().await;
+
+        state
+            .settings
+            .networks
+            .get(network)
+            .map(|network_tokens| {
+                let mut tokens: Vec<String> = network_tokens.tokens.keys().cloned().collect();
+                tokens.sort();
+                tokens
+            })
+            .unwrap_or_default()
+    }
+}

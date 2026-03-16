@@ -7,6 +7,60 @@ use x402_types::config::LiteralOrEnv;
 
 use crate::chain::SolanaChainReference;
 
+/// Deserializer that accepts either a single URL string or an array of URL strings.
+///
+/// This enables backwards-compatible configuration: existing configs with a single
+/// `"rpc": "https://..."` string still work, while new configs can specify an array
+/// `"rpc": ["https://primary...", "https://fallback..."]` for ordered failover.
+fn one_or_many_url<'de, D>(deserializer: D) -> Result<Vec<LiteralOrEnv<Url>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct OneOrManyVisitor;
+
+    impl<'de> de::Visitor<'de> for OneOrManyVisitor {
+        type Value = Vec<LiteralOrEnv<Url>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a single URL string or array of URL strings")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            let url =
+                LiteralOrEnv::<Url>::deserialize(serde::de::value::StrDeserializer::new(v))?;
+            Ok(vec![url])
+        }
+
+        fn visit_seq<S: de::SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
+            let mut urls = Vec::new();
+            while let Some(url) = seq.next_element::<LiteralOrEnv<Url>>()? {
+                urls.push(url);
+            }
+            if urls.is_empty() {
+                return Err(de::Error::custom("rpc array must not be empty"));
+            }
+            Ok(urls)
+        }
+    }
+
+    deserializer.deserialize_any(OneOrManyVisitor)
+}
+
+/// Serializer that writes a single URL as a plain string, and multiple URLs as an array.
+/// This preserves backwards compatibility for configs that only have one RPC endpoint.
+fn serialize_one_or_many_url<S>(urls: &[LiteralOrEnv<Url>], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if urls.len() == 1 {
+        urls[0].serialize(serializer)
+    } else {
+        urls.serialize(serializer)
+    }
+}
+
 /// Configuration for a Solana chain in the x402 facilitator.
 ///
 /// This struct combines a chain reference with chain-specific configuration
@@ -35,8 +89,16 @@ impl SolanaChainConfig {
     pub fn signer(&self) -> &SolanaSignerConfig {
         &self.inner.signer
     }
-    /// Returns the RPC endpoint URL for this chain.
+    /// Returns the primary RPC endpoint URL for this chain (first in the list).
     pub fn rpc(&self) -> &Url {
+        &self.inner.rpc[0]
+    }
+
+    /// Returns all configured RPC endpoint URLs.
+    ///
+    /// When multiple URLs are configured, they are used for ordered fallback:
+    /// the first URL is the primary, subsequent URLs are tried on retryable errors.
+    pub fn rpc_urls(&self) -> &[LiteralOrEnv<Url>] {
         &self.inner.rpc
     }
 
@@ -72,8 +134,10 @@ pub struct SolanaChainConfigInner {
     /// Signer configuration for this chain (required).
     /// A single private key (base58 format, 64 bytes) or env var reference.
     pub signer: SolanaSignerConfig,
-    /// RPC provider configuration for this chain (required).
-    pub rpc: LiteralOrEnv<Url>,
+    /// RPC provider endpoint(s). Supports a single URL string or an array of URL strings.
+    /// When multiple URLs are provided, ordered fallback is used.
+    #[serde(deserialize_with = "one_or_many_url", serialize_with = "serialize_one_or_many_url")]
+    pub rpc: Vec<LiteralOrEnv<Url>>,
     /// RPC pubsub provider endpoint (optional)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pubsub: Option<LiteralOrEnv<Url>>,

@@ -60,6 +60,11 @@ impl Eip155ChainConfig {
         &self.inner.rpc
     }
 
+    /// Returns whether to use ordered-failover transport.
+    pub fn ordered_fallback(&self) -> Option<bool> {
+        self.inner.ordered_fallback
+    }
+
     /// Returns the numeric chain reference.
     pub fn chain_reference(&self) -> Eip155ChainReference {
         self.chain_reference
@@ -83,6 +88,9 @@ pub struct Eip155ChainConfigInner {
     /// How long to wait till the transaction receipt is available (optional)
     #[serde(default = "eip155_chain_config::default_receipt_timeout_secs")]
     pub receipt_timeout_secs: u64,
+    /// Whether to use ordered-failover transport instead of the default score-based fallback.
+    #[serde(default)]
+    pub ordered_fallback: Option<bool>,
 }
 
 mod eip155_chain_config {

@@ -38,6 +38,9 @@ pub use types::*;
 pub mod config;
 
 #[cfg(feature = "facilitator")]
+pub mod fallback_rpc;
+
+#[cfg(feature = "facilitator")]
 pub mod provider;
 #[cfg(feature = "facilitator")]
 pub use provider::*;

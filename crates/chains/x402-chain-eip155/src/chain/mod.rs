@@ -46,6 +46,9 @@ pub mod pending_nonce_manager;
 pub use pending_nonce_manager::*;
 
 #[cfg(feature = "facilitator")]
+pub mod ordered_fallback;
+
+#[cfg(feature = "facilitator")]
 pub mod provider;
 #[cfg(feature = "facilitator")]
 pub use provider::*;
