@@ -44,6 +44,11 @@ impl SolanaFallbackClient {
         self.clients[0].url()
     }
 
+    /// Returns a reference to the primary (first) `RpcClient`.
+    pub fn primary_client(&self) -> &RpcClient {
+        &self.clients[0]
+    }
+
     /// Fetch multiple accounts, with fallback on retryable errors.
     pub async fn get_multiple_accounts(
         &self,

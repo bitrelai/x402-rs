@@ -9,11 +9,18 @@ name = "facilitator-enterprise"
 path = "src/main.rs"
 
 [features]
-default = ["chain-eip155", "chain-solana"]
+default = ["telemetry", "chain-eip155", "chain-solana"]
+telemetry = [
+    "x402-types/telemetry",
+    "x402-facilitator-local/telemetry",
+    "x402-chain-eip155?/telemetry",
+    "x402-chain-solana?/telemetry",
+    "x402-chain-aptos?/telemetry",
+]
 chain-eip155 = ["dep:x402-chain-eip155"]
 chain-solana = ["dep:x402-chain-solana"]
 chain-aptos = ["dep:x402-chain-aptos"]
-full = ["chain-eip155", "chain-solana", "chain-aptos"]
+full = ["telemetry", "chain-eip155", "chain-solana", "chain-aptos"]
 
 [dependencies]
 x402-types = { workspace = true, features = ["cli"] }

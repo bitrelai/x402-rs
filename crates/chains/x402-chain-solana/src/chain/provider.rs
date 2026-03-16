@@ -23,7 +23,110 @@ use x402_types::proto::PaymentVerificationError;
 use x402_types::scheme::X402SchemeFacilitatorError;
 
 use crate::chain::config::SolanaChainConfig;
+use crate::chain::fallback_rpc::SolanaFallbackClient;
 use crate::chain::types::{Address, SolanaChainReference};
+
+/// RPC backend for [`SolanaChainProvider`].
+///
+/// When a single RPC URL is configured, [`RpcBackend::Single`] wraps a plain
+/// `RpcClient`. When multiple URLs are configured, [`RpcBackend::Fallback`]
+/// wraps a [`SolanaFallbackClient`] that tries each endpoint in order on
+/// retryable errors.
+enum RpcBackend {
+    /// A single RPC endpoint.
+    Single(Arc<RpcClient>),
+    /// Ordered-failover across multiple RPC endpoints.
+    Fallback(Arc<SolanaFallbackClient>),
+}
+
+impl RpcBackend {
+    /// Returns the URL of the primary RPC endpoint (for logging / debug).
+    fn url(&self) -> String {
+        match self {
+            RpcBackend::Single(client) => client.url(),
+            RpcBackend::Fallback(client) => client.url(),
+        }
+    }
+
+    /// Returns a reference to the primary (first) `RpcClient`.
+    ///
+    /// For the single-client backend this is the only client. For the fallback
+    /// backend this is the first client in the ordered list.
+    fn primary_client(&self) -> &RpcClient {
+        match self {
+            RpcBackend::Single(client) => client,
+            RpcBackend::Fallback(client) => client.primary_client(),
+        }
+    }
+
+    /// Fetch multiple accounts, delegating failover to the backend.
+    async fn get_multiple_accounts(
+        &self,
+        pubkeys: &[Pubkey],
+    ) -> Result<Vec<Option<Account>>, ClientError> {
+        match self {
+            RpcBackend::Single(client) => client.get_multiple_accounts(pubkeys).await,
+            RpcBackend::Fallback(client) => client.get_multiple_accounts(pubkeys).await,
+        }
+    }
+
+    /// Simulate a transaction, delegating failover to the backend.
+    async fn simulate_transaction_with_config(
+        &self,
+        tx: &VersionedTransaction,
+        cfg: RpcSimulateTransactionConfig,
+    ) -> Result<
+        solana_client::rpc_response::Response<
+            solana_client::rpc_response::RpcSimulateTransactionResult,
+        >,
+        ClientError,
+    > {
+        match self {
+            RpcBackend::Single(client) => {
+                client.simulate_transaction_with_config(tx, cfg).await
+            }
+            RpcBackend::Fallback(client) => {
+                client.simulate_transaction_with_config(tx, cfg).await
+            }
+        }
+    }
+
+    /// Send a transaction without waiting for confirmation.
+    async fn send_transaction_with_config(
+        &self,
+        tx: &VersionedTransaction,
+        cfg: RpcSendTransactionConfig,
+    ) -> Result<Signature, ClientError> {
+        match self {
+            RpcBackend::Single(client) => {
+                client.send_transaction_with_config(tx, cfg).await
+            }
+            RpcBackend::Fallback(client) => {
+                client.send_transaction_with_config(tx, cfg).await
+            }
+        }
+    }
+
+    /// Confirm a transaction, delegating failover to the backend.
+    async fn confirm_transaction_with_commitment(
+        &self,
+        signature: &Signature,
+        commitment_config: CommitmentConfig,
+    ) -> Result<solana_client::rpc_response::Response<bool>, ClientError> {
+        match self {
+            RpcBackend::Single(client) => {
+                client
+                    .confirm_transaction_with_commitment(signature, commitment_config)
+                    .await
+            }
+            RpcBackend::Fallback(client) => {
+                client
+                    .confirm_transaction_with_commitment(signature, commitment_config)
+                    .await
+            }
+        }
+    }
+}
 
 /// Errors that can occur when interacting with a Solana chain provider.
 #[derive(thiserror::Error, Debug)]
@@ -91,8 +194,8 @@ pub struct SolanaChainProvider {
     chain: SolanaChainReference,
     /// The keypair used for signing transactions.
     keypair: Arc<Keypair>,
-    /// The RPC client for sending requests.
-    rpc_client: Arc<RpcClient>,
+    /// The RPC backend — single client or ordered-failover.
+    rpc_backend: RpcBackend,
     /// Optional WebSocket client for subscriptions.
     pubsub_client: Option<Arc<PubsubClient>>,
     /// Maximum compute units allowed per transaction.
@@ -106,13 +209,13 @@ impl Debug for SolanaChainProvider {
         f.debug_struct("SolanaChainProvider")
             .field("pubkey", &self.keypair.pubkey())
             .field("chain", &self.chain)
-            .field("rpc_url", &self.rpc_client.url())
+            .field("rpc_url", &self.rpc_backend.url())
             .finish()
     }
 }
 
 impl SolanaChainProvider {
-    /// Creates a new Solana chain provider.
+    /// Creates a new Solana chain provider with a single RPC endpoint.
     ///
     /// # Parameters
     ///
@@ -145,7 +248,7 @@ impl SolanaChainProvider {
                 signers = ?signer_addresses,
                 max_compute_unit_limit,
                 max_compute_unit_price,
-                "Using Solana provider"
+                "Using Solana provider (single RPC)"
             );
         }
         let rpc_client = RpcClient::new(rpc_url);
@@ -158,17 +261,83 @@ impl SolanaChainProvider {
         Ok(Self {
             keypair: Arc::new(keypair),
             chain,
-            rpc_client: Arc::new(rpc_client),
+            rpc_backend: RpcBackend::Single(Arc::new(rpc_client)),
             pubsub_client: pubsub_client.map(Arc::new),
             max_compute_unit_limit,
             max_compute_unit_price,
         })
     }
 
-    /// Returns a cloned reference to the RPC client.
+    /// Creates a new Solana chain provider with ordered-failover across
+    /// multiple RPC endpoints.
+    ///
+    /// The first URL is the primary; subsequent URLs are tried on retryable
+    /// errors (transport failures, rate limits, unhealthy nodes).
+    ///
+    /// # Parameters
+    ///
+    /// - `keypair`: The keypair used for signing transactions (fee payer)
+    /// - `rpc_urls`: Ordered list of HTTP RPC endpoint URLs (must not be empty)
+    /// - `pubsub_url`: Optional WebSocket pubsub endpoint for faster confirmations
+    /// - `chain`: The Solana network identifier
+    /// - `max_compute_unit_limit`: Maximum compute units per transaction
+    /// - `max_compute_unit_price`: Maximum price per compute unit in micro-lamports
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WebSocket connection fails to establish.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rpc_urls` is empty.
+    pub async fn new_with_fallback(
+        keypair: Keypair,
+        rpc_urls: Vec<url::Url>,
+        pubsub_url: Option<String>,
+        chain: SolanaChainReference,
+        max_compute_unit_limit: u32,
+        max_compute_unit_price: u64,
+    ) -> Result<Self, PubsubClientError> {
+        #[cfg(feature = "telemetry")]
+        {
+            let signer_addresses = vec![keypair.pubkey()];
+            let chain_id: ChainId = chain.into();
+            tracing::info!(
+                chain = %chain_id,
+                rpc_urls = ?rpc_urls,
+                pubsub = ?pubsub_url,
+                signers = ?signer_addresses,
+                max_compute_unit_limit,
+                max_compute_unit_price,
+                "Using Solana provider (fallback RPC, {} endpoints)",
+                rpc_urls.len(),
+            );
+        }
+        let fallback_client =
+            SolanaFallbackClient::new(rpc_urls, Duration::from_secs(10));
+        let pubsub_client = if let Some(pubsub_url) = pubsub_url {
+            let client = PubsubClient::new(pubsub_url).await?;
+            Some(client)
+        } else {
+            None
+        };
+        Ok(Self {
+            keypair: Arc::new(keypair),
+            chain,
+            rpc_backend: RpcBackend::Fallback(Arc::new(fallback_client)),
+            pubsub_client: pubsub_client.map(Arc::new),
+            max_compute_unit_limit,
+            max_compute_unit_price,
+        })
+    }
+
+    /// Returns a reference to the primary (first) RPC client.
+    ///
+    /// When using a single backend, this is the only client. When using a
+    /// fallback backend, this is the first client in the ordered list.
     #[allow(dead_code)] // Public for consumption by downstream crates.
-    pub fn rpc_client(&self) -> Arc<RpcClient> {
-        Arc::clone(&self.rpc_client)
+    pub fn rpc_client(&self) -> &RpcClient {
+        self.rpc_backend.primary_client()
     }
 
     /// Returns a cloned reference to the optional pubsub client.
@@ -180,7 +349,9 @@ impl SolanaChainProvider {
     /// Sends a signed transaction to the network without waiting for confirmation.
     ///
     /// This method submits the transaction with `skip_preflight: true` to avoid
-    /// simulation delays. The transaction should already be signed.
+    /// simulation delays. The transaction should already be signed. When the
+    /// fallback backend is active, retryable errors cause automatic failover
+    /// to the next RPC endpoint.
     ///
     /// # Errors
     ///
@@ -190,7 +361,7 @@ impl SolanaChainProvider {
         tx: &VersionedTransaction,
     ) -> Result<Signature, SolanaChainProviderError> {
         let signature = self
-            .rpc_client
+            .rpc_backend
             .send_transaction_with_config(
                 tx,
                 RpcSendTransactionConfig {
@@ -206,21 +377,35 @@ impl SolanaChainProvider {
 #[async_trait::async_trait]
 impl FromConfig<SolanaChainConfig> for SolanaChainProvider {
     async fn from_config(config: &SolanaChainConfig) -> Result<Self, Box<dyn std::error::Error>> {
-        let rpc_url = config.rpc();
         let pubsub_url = config.pubsub().map(|url| url.to_string());
         let keypair = Keypair::from_base58_string(&config.signer().to_string());
         let max_compute_unit_limit = config.max_compute_unit_limit();
         let max_compute_unit_price = config.max_compute_unit_price();
         let chain = config.chain_reference();
-        let provider = Self::new(
-            keypair,
-            rpc_url.to_string(),
-            pubsub_url,
-            chain,
-            max_compute_unit_limit,
-            max_compute_unit_price,
-        )
-        .await?;
+
+        let rpc_urls = config.rpc_urls();
+        let provider = if rpc_urls.len() > 1 {
+            let urls: Vec<url::Url> = rpc_urls.iter().map(|u| (**u).clone()).collect();
+            Self::new_with_fallback(
+                keypair,
+                urls,
+                pubsub_url,
+                chain,
+                max_compute_unit_limit,
+                max_compute_unit_price,
+            )
+            .await?
+        } else {
+            Self::new(
+                keypair,
+                config.rpc().to_string(),
+                pubsub_url,
+                chain,
+                max_compute_unit_limit,
+                max_compute_unit_price,
+            )
+            .await?
+        };
         Ok(provider)
     }
 }
@@ -288,7 +473,7 @@ impl SolanaChainProviderLike for SolanaChainProvider {
         cfg: RpcSimulateTransactionConfig,
     ) -> Result<(), SolanaChainProviderError> {
         let sim = self
-            .rpc_client
+            .rpc_backend
             .simulate_transaction_with_config(tx, cfg)
             .await?;
         match sim.value.err {
@@ -301,7 +486,7 @@ impl SolanaChainProviderLike for SolanaChainProvider {
         &self,
         pubkeys: &[Pubkey],
     ) -> Result<Vec<Option<Account>>, SolanaChainProviderError> {
-        let accounts = self.rpc_client.get_multiple_accounts(pubkeys).await?;
+        let accounts = self.rpc_backend.get_multiple_accounts(pubkeys).await?;
         Ok(accounts)
     }
 
@@ -391,7 +576,7 @@ impl SolanaChainProviderLike for SolanaChainProvider {
             self.send(tx).await?;
             loop {
                 let confirmed = self
-                    .rpc_client
+                    .rpc_backend
                     .confirm_transaction_with_commitment(tx_sig, commitment_config)
                     .await?;
                 if confirmed.value {

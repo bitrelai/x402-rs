@@ -76,53 +76,74 @@ fn extract_chain_id(request: &proto::SettleRequest) -> Option<ChainId> {
 
 /// Extract EIP-3009 settlement metadata from a raw SettleRequest JSON.
 ///
-/// Parses both v1 and v2 payloads to find the authorization fields.
+/// Handles both v1 and v2 payload formats:
+/// - V2: `paymentPayload.authorization.*`, `paymentPayload.accepted.asset`, `paymentPayload.signature`
+/// - V1: `paymentPayload.payload.authorization.*`, `paymentRequirements.asset`, `paymentPayload.payload.signature`
+///
 /// Returns None if the payload doesn't contain EIP-3009 authorization data.
 fn extract_eip3009_metadata(request: &proto::SettleRequest) -> Option<SettlementMetadata> {
-    use alloy::primitives::{Address, Bytes, FixedBytes, U256};
+    use alloy::primitives::{Address, Bytes, FixedBytes};
 
-    // Try to parse the JSON and extract authorization fields
     let value: serde_json::Value = serde_json::from_str(request.as_str()).ok()?;
+    let payment_payload = value.get("paymentPayload")?;
 
-    let payload = value.get("paymentPayload")?;
-    let authorization = payload.get("authorization")?;
-    let accepted = payload.get("accepted")?;
+    // Try V2 first: authorization at paymentPayload.authorization
+    // Then V1: authorization at paymentPayload.payload.authorization
+    let (authorization, signature_obj, asset_str) =
+        if let Some(auth) = payment_payload.get("authorization") {
+            // V2 format
+            let sig = payment_payload;
+            let asset = payment_payload.get("accepted")?.get("asset")?.as_str()?;
+            (auth, sig, asset)
+        } else if let Some(inner_payload) = payment_payload.get("payload") {
+            // V1 format: authorization and signature inside payload
+            let auth = inner_payload.get("authorization")?;
+            let asset = value.get("paymentRequirements")?.get("asset")?.as_str()?;
+            (auth, inner_payload, asset)
+        } else {
+            return None;
+        };
 
     let from: Address = authorization.get("from")?.as_str()?.parse().ok()?;
     let to: Address = authorization.get("to")?.as_str()?.parse().ok()?;
-    let value_str = authorization.get("value")?.as_str()?;
-    let value = U256::from_str_radix(value_str, 10)
-        .or_else(|_| U256::from_str_radix(value_str.trim_start_matches("0x"), 16))
-        .ok()?;
-    let valid_after_str = authorization.get("validAfter")?.as_str()?;
-    let valid_after = U256::from_str_radix(valid_after_str, 10)
-        .or_else(|_| U256::from_str_radix(valid_after_str.trim_start_matches("0x"), 16))
-        .ok()?;
-    let valid_before_str = authorization.get("validBefore")?.as_str()?;
-    let valid_before = U256::from_str_radix(valid_before_str, 10)
-        .or_else(|_| U256::from_str_radix(valid_before_str.trim_start_matches("0x"), 16))
-        .ok()?;
+
+    let value_u256 = parse_u256_field(authorization.get("value")?)?;
+    let valid_after = parse_u256_field(authorization.get("validAfter")?)?;
+    let valid_before = parse_u256_field(authorization.get("validBefore")?)?;
+
     let nonce_str = authorization.get("nonce")?.as_str()?;
     let nonce: FixedBytes<32> = nonce_str.parse().ok()?;
 
-    // Signature is at top level of paymentPayload
-    let signature_str = payload.get("signature")?.as_str()?;
+    let signature_str = signature_obj.get("signature")?.as_str()?;
     let signature: Bytes = signature_str.parse().ok()?;
 
-    // Asset (token contract) from accepted requirements
-    let asset_str = accepted.get("asset")?.as_str()?;
     let contract_address: Address = asset_str.parse().ok()?;
 
     Some(SettlementMetadata {
         from,
         to,
-        value,
+        value: value_u256,
         valid_after,
         valid_before,
         nonce,
         signature,
         contract_address,
     })
+}
+
+/// Parse a U256 from a JSON value that may be a string (decimal or hex) or a number.
+fn parse_u256_field(val: &serde_json::Value) -> Option<alloy::primitives::U256> {
+    use alloy::primitives::U256;
+
+    if let Some(s) = val.as_str() {
+        U256::from_str_radix(s, 10)
+            .or_else(|_| U256::from_str_radix(s.trim_start_matches("0x"), 16))
+            .ok()
+    } else if let Some(n) = val.as_u64() {
+        Some(U256::from(n))
+    } else {
+        None
+    }
 }
 
 /// Extract the network name from a chain ID (e.g., "eip155:8453" -> "base").

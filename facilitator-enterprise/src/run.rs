@@ -24,10 +24,13 @@ use crate::batch::queue::BatchQueueManager;
 use crate::batch::BatchFacilitator;
 use crate::config::Config;
 use crate::enterprise_config::EnterpriseConfig;
+use crate::hooks::admin::admin_hook_routes;
+use crate::hooks::HookManager;
 use crate::security::abuse::{AbuseDetector, AbuseDetectorConfig};
 use crate::security::ip_filter::{IpFilter, IpFilterConfig};
 use crate::security::rate_limit::{RateLimiter, RateLimiterConfig};
 use crate::security::{AdminAuth, ApiKeyAuth};
+use crate::tokens::TokenManager;
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
@@ -35,6 +38,15 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     dotenv().ok();
 
+    #[cfg(feature = "telemetry")]
+    let telemetry_providers = x402_facilitator_local::util::Telemetry::new()
+        .with_name(env!("CARGO_PKG_NAME"))
+        .with_version(env!("CARGO_PKG_VERSION"))
+        .register();
+    #[cfg(feature = "telemetry")]
+    let telemetry_layer = telemetry_providers.http_tracing();
+
+    #[cfg(not(feature = "telemetry"))]
     tracing_subscriber::fmt::init();
 
     // Load upstream chain/scheme config (JSON)
@@ -78,12 +90,69 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let facilitator = Arc::new(FacilitatorLocal::new(scheme_registry));
 
+    // Initialize token manager (optional — loads from TOKENS_FILE or tokens.toml)
+    let token_manager = {
+        let tokens_path =
+            std::env::var("TOKENS_FILE").unwrap_or_else(|_| "tokens.toml".to_string());
+        match TokenManager::new(&tokens_path) {
+            Ok(tm) => {
+                tracing::info!(path = %tokens_path, "Token manager initialized");
+                Some(Arc::new(tm))
+            }
+            Err(e) => {
+                tracing::info!(
+                    path = %tokens_path,
+                    error = %e,
+                    "Token manager not initialized (file not found or invalid — continuing without token filtering)"
+                );
+                None
+            }
+        }
+    };
+
+    // Initialize hook manager (optional — loads from HOOKS_FILE or hooks.toml)
+    let hook_manager = {
+        let hooks_path =
+            std::env::var("HOOKS_FILE").unwrap_or_else(|_| "hooks.toml".to_string());
+        if let Some(ref tm) = token_manager {
+            match HookManager::new_with_tokens(&hooks_path, tm.as_ref().clone()) {
+                Ok(hm) => {
+                    tracing::info!(path = %hooks_path, "Hook manager initialized with token filtering");
+                    Some(Arc::new(hm))
+                }
+                Err(e) => {
+                    tracing::info!(
+                        path = %hooks_path,
+                        error = %e,
+                        "Hook manager not initialized (file not found or invalid — continuing without hooks)"
+                    );
+                    None
+                }
+            }
+        } else {
+            match HookManager::new(&hooks_path) {
+                Ok(hm) => {
+                    tracing::info!(path = %hooks_path, "Hook manager initialized (no token filtering)");
+                    Some(Arc::new(hm))
+                }
+                Err(e) => {
+                    tracing::info!(
+                        path = %hooks_path,
+                        error = %e,
+                        "Hook manager not initialized (file not found or invalid — continuing without hooks)"
+                    );
+                    None
+                }
+            }
+        }
+    };
+
     // Build batch queue manager if batch settlement is enabled
     let batch_queue = if enterprise_config.batch_settlement.is_enabled_anywhere() {
         tracing::info!("Batch settlement enabled");
         Some(Arc::new(BatchQueueManager::new(
             enterprise_config.batch_settlement.clone(),
-            None, // TODO: wire hook_manager when hooks are integrated with batch
+            hook_manager.clone(),
         )))
     } else {
         None
@@ -130,10 +199,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Enterprise landing page
     let landing_route = Router::new().route("/", get(get_enterprise_root));
 
-    // Admin routes
+    // Admin stats route
     let ad_for_stats = abuse_detector.clone();
     let batch_for_stats = axum_state.batch_queue.clone();
-    let admin_routes = {
+    let admin_stats_routes = {
         let admin_auth_clone = admin_auth.clone();
         Router::new()
             .route(
@@ -162,16 +231,61 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }))
     };
 
-    // Compose all routes with middleware layers
-    let app = Router::new()
+    // Hook admin routes (optional — only if hook manager is initialized)
+    let hook_admin_routes = hook_manager.as_ref().map(|hm| {
+        admin_hook_routes(Arc::clone(hm), admin_auth.as_ref().clone())
+    });
+
+    // Token admin reload route (optional — only if token manager is initialized)
+    let token_admin_routes = token_manager.as_ref().map(|tm| {
+        let tm_clone = Arc::clone(tm);
+        let admin_auth_clone = admin_auth.clone();
+        Router::new()
+            .route(
+                "/admin/tokens/reload",
+                axum::routing::post(move || {
+                    let tm = tm_clone.clone();
+                    async move {
+                        match tm.reload().await {
+                            Ok(()) => axum::Json(serde_json::json!({
+                                "success": true,
+                                "message": "Token configuration reloaded"
+                            })),
+                            Err(e) => axum::Json(serde_json::json!({
+                                "success": false,
+                                "error": e
+                            })),
+                        }
+                    }
+                }),
+            )
+            .layer(middleware::from_fn(move |req, next| {
+                let auth = admin_auth_clone.clone();
+                async move { auth.middleware(req, next).await }
+            }))
+    });
+
+    // Compose all routes
+    let mut app = Router::new()
         .merge(landing_route)
         .merge(protocol_routes)
-        .merge(admin_routes);
+        .merge(admin_stats_routes);
 
+    if let Some(hook_routes) = hook_admin_routes {
+        app = app.merge(hook_routes);
+    }
+    if let Some(token_routes) = token_admin_routes {
+        app = app.merge(token_routes);
+    }
+
+    // Apply middleware layers (outermost first)
     let abuse_for_mw = abuse_detector.clone();
     let api_key_for_mw = api_key_auth.clone();
     let rate_limiter_for_mw = rate_limiter.clone();
     let ip_filter_for_mw = ip_filter.clone();
+
+    #[cfg(feature = "telemetry")]
+    let app = app.layer(telemetry_layer);
 
     let app = app
         .layer(middleware::from_fn(move |req, next| {
@@ -211,9 +325,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let addr = SocketAddr::new(config.host(), config.port());
+    #[cfg(feature = "telemetry")]
     tracing::info!("Starting enterprise facilitator at http://{}", addr);
+    #[cfg(not(feature = "telemetry"))]
+    println!("Starting enterprise facilitator at http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    #[cfg(feature = "telemetry")]
+    let listener = listener;  // no-op, just for symmetry with upstream's inspect_err pattern
 
     let sig_down = SigDown::try_new()?;
     let axum_cancellation_token = sig_down.cancellation_token();
@@ -251,7 +370,12 @@ h1{{border-bottom:2px solid #333}}</style></head>
 <ul>
 <li><code>GET /admin/stats</code> — Security and batch statistics (requires X-Admin-Key)</li>
 <li><code>GET /admin/hooks</code> — List hook definitions (requires X-Admin-Key)</li>
+<li><code>GET /admin/hooks/mappings</code> — List destination mappings (requires X-Admin-Key)</li>
+<li><code>GET /admin/hooks/status</code> — Hook system status (requires X-Admin-Key)</li>
 <li><code>POST /admin/hooks/reload</code> — Reload hook config (requires X-Admin-Key)</li>
+<li><code>POST /admin/hooks/{{name}}/enable</code> — Enable a hook (requires X-Admin-Key)</li>
+<li><code>POST /admin/hooks/{{name}}/disable</code> — Disable a hook (requires X-Admin-Key)</li>
+<li><code>POST /admin/tokens/reload</code> — Reload token config (requires X-Admin-Key)</li>
 </ul>
 </body></html>"#
     ))
