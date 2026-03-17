@@ -65,6 +65,11 @@ impl Eip155ChainConfig {
         self.inner.ordered_fallback
     }
 
+    /// Returns the configured poll interval in milliseconds, if set.
+    pub fn poll_interval_ms(&self) -> Option<u64> {
+        self.inner.poll_interval_ms
+    }
+
     /// Returns the numeric chain reference.
     pub fn chain_reference(&self) -> Eip155ChainReference {
         self.chain_reference
@@ -91,6 +96,11 @@ pub struct Eip155ChainConfigInner {
     /// Whether to use ordered-failover transport instead of the default score-based fallback.
     #[serde(default)]
     pub ordered_fallback: Option<bool>,
+    /// Override the receipt poll interval in milliseconds.
+    /// Alloy's default is 7000ms for remote RPCs. When flashblocks is true,
+    /// defaults to 200ms. Set explicitly to override for any chain.
+    #[serde(default)]
+    pub poll_interval_ms: Option<u64>,
 }
 
 mod eip155_chain_config {

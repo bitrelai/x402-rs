@@ -82,7 +82,7 @@ impl Eip155ChainProvider {
         chain_id: ChainId,
         rpc: &[RpcConfig],
         ordered_fallback: bool,
-        flashblocks: bool,
+        poll_interval_ms: Option<u64>,
     ) -> Result<RpcClient, Box<dyn std::error::Error>> {
         let transports = rpc
             .iter()
@@ -120,11 +120,10 @@ impl Eip155ChainProvider {
             RpcClient::new(fallback, false)
         };
 
-        // Override Alloy's 7s default poll interval for flashblock chains.
-        // Without this, receipt fetching waits up to 7s per poll even though
-        // flashblock chains confirm in ~200ms.
-        if flashblocks {
-            client = client.with_poll_interval(std::time::Duration::from_millis(200));
+        // Override Alloy's 7s default poll interval if configured.
+        // Flashblocks chains default to 200ms. Explicit poll_interval_ms overrides everything.
+        if let Some(poll_ms) = poll_interval_ms {
+            client = client.with_poll_interval(std::time::Duration::from_millis(poll_ms));
         }
 
         Ok(client)
@@ -186,11 +185,16 @@ impl FromConfig<Eip155ChainConfig> for Eip155ChainProvider {
         let signer_cursor = Arc::new(AtomicUsize::new(0));
 
         // 2. Transports
+        // Resolve poll interval: explicit config > flashblocks default (200ms) > Alloy default (7s)
+        let poll_interval_ms = config
+            .poll_interval_ms()
+            .or(if config.flashblocks() { Some(200) } else { None });
+
         let client = Self::rpc_client(
             config.chain_id(),
             config.rpc(),
             config.ordered_fallback().unwrap_or(false),
-            config.flashblocks(),
+            poll_interval_ms,
         )?;
 
         // 3. Provider
