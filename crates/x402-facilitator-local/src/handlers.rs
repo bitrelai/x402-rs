@@ -9,8 +9,10 @@
 //! Each endpoint consumes or produces structured JSON payloads defined in `x402-rs`,
 //! and is compatible with official x402 client SDKs.
 
+use std::time::Instant;
+
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router, response::IntoResponse};
@@ -161,8 +163,14 @@ where
     A: Facilitator,
     A::Error: IntoResponse,
 {
+    let start = Instant::now();
     match facilitator.verify(&body).await {
-        Ok(valid_response) => (StatusCode::OK, Json(valid_response)).into_response(),
+        Ok(valid_response) => {
+            let timing = server_timing(&[("verify", start.elapsed())]);
+            let mut response = (StatusCode::OK, Json(valid_response)).into_response();
+            response.headers_mut().insert("server-timing", timing);
+            response
+        }
         Err(error) => {
             #[cfg(feature = "telemetry")]
             tracing::warn!(
@@ -196,8 +204,14 @@ where
     A: Facilitator,
     A::Error: IntoResponse,
 {
+    let start = Instant::now();
     match facilitator.settle(&body).await {
-        Ok(valid_response) => (StatusCode::OK, Json(valid_response)).into_response(),
+        Ok(valid_response) => {
+            let timing = server_timing(&[("settle", start.elapsed())]);
+            let mut response = (StatusCode::OK, Json(valid_response)).into_response();
+            response.headers_mut().insert("server-timing", timing);
+            response
+        }
         Err(error) => {
             #[cfg(feature = "telemetry")]
             tracing::warn!(
@@ -272,4 +286,17 @@ fn scheme_error_to_status_code(error: &X402SchemeFacilitatorError) -> StatusCode
         }
         X402SchemeFacilitatorError::OnchainFailure(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+
+/// Formats phase durations into a `Server-Timing` header value.
+///
+/// Each entry becomes `name;dur=X.X` with millisecond precision,
+/// e.g. `settle;dur=1234.5` or `verify;dur=42.0`.
+fn server_timing(phases: &[(&str, std::time::Duration)]) -> HeaderValue {
+    let value: String = phases
+        .iter()
+        .map(|(name, dur)| format!("{};dur={:.1}", name, dur.as_secs_f64() * 1000.0))
+        .collect::<Vec<_>>()
+        .join(", ");
+    HeaderValue::from_str(&value).unwrap_or_else(|_| HeaderValue::from_static(""))
 }
