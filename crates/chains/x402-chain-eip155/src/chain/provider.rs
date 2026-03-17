@@ -82,6 +82,7 @@ impl Eip155ChainProvider {
         chain_id: ChainId,
         rpc: &[RpcConfig],
         ordered_fallback: bool,
+        flashblocks: bool,
     ) -> Result<RpcClient, Box<dyn std::error::Error>> {
         let transports = rpc
             .iter()
@@ -102,11 +103,11 @@ impl Eip155ChainProvider {
             })
             .collect::<Vec<_>>();
 
-        if ordered_fallback {
+        let mut client = if ordered_fallback {
             use crate::chain::ordered_fallback::OrderedFallbackService;
             let fallback =
                 OrderedFallbackService::new(transports, 3, std::time::Duration::from_secs(30))?;
-            Ok(RpcClient::new(fallback, false))
+            RpcClient::new(fallback, false)
         } else {
             let fallback = ServiceBuilder::new()
                 .layer(
@@ -116,8 +117,17 @@ impl Eip155ChainProvider {
                     ),
                 )
                 .service(transports);
-            Ok(RpcClient::new(fallback, false))
+            RpcClient::new(fallback, false)
+        };
+
+        // Override Alloy's 7s default poll interval for flashblock chains.
+        // Without this, receipt fetching waits up to 7s per poll even though
+        // flashblock chains confirm in ~200ms.
+        if flashblocks {
+            client = client.with_poll_interval(std::time::Duration::from_millis(200));
         }
+
+        Ok(client)
     }
 
     /// Round-robin selection of next signer from wallet.
@@ -180,6 +190,7 @@ impl FromConfig<Eip155ChainConfig> for Eip155ChainProvider {
             config.chain_id(),
             config.rpc(),
             config.ordered_fallback().unwrap_or(false),
+            config.flashblocks(),
         )?;
 
         // 3. Provider
