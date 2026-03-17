@@ -160,7 +160,20 @@ impl RateLimiter {
 
     pub fn cleanup_expired_bans(&self) {
         let now = SystemTime::now();
+        let window = Duration::from_secs(1);
+
         self.bans.retain(|_, &mut expiry| now < expiry);
+
+        // Clean up stale request history and violation trackers to prevent
+        // unbounded memory growth from IP-rotating attackers.
+        self.request_history.retain(|_, timestamps| {
+            timestamps.retain(|&ts| now.duration_since(ts).unwrap_or_default() < window);
+            !timestamps.is_empty()
+        });
+
+        self.violations.retain(|_, tracker| {
+            now.duration_since(tracker.last_reset).unwrap_or_default() < Duration::from_secs(60)
+        });
     }
 }
 

@@ -83,14 +83,24 @@ impl BatchQueueManager {
             let queues_map = Arc::clone(&self.evm_queues);
             let network_key = network.clone();
 
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 queue_clone
                     .process_loop(&provider_clone, hook_manager.as_ref(), allow_partial)
                     .await;
+            });
+
+            // Separate task to await the handle and recover from panics.
+            let queue_guard = Arc::clone(&queue);
+            tokio::spawn(async move {
+                if handle.await.is_err() {
+                    // process_loop panicked — clear task_running so future enqueues
+                    // can spawn a new worker instead of being orphaned.
+                    tracing::error!(network = %network_key, "Batch processor panicked, clearing task_running");
+                    queue_guard.task_running.store(false, Ordering::SeqCst);
+                }
 
                 // process_loop clears task_running under the pending lock when the
-                // queue is empty, so we do NOT clear it here. We only clean up the
-                // DashMap entry.
+                // queue is empty normally. We only clean up the DashMap entry here.
                 queues_map.remove(&network_key);
             });
         }

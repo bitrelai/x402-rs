@@ -11,9 +11,17 @@ fn ct_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AdminAuth {
     admin_key: Option<String>,
+}
+
+impl std::fmt::Debug for AdminAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminAuth")
+            .field("admin_key", &self.admin_key.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 impl AdminAuth {
