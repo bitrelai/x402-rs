@@ -88,7 +88,9 @@ impl BatchQueueManager {
                     .process_loop(&provider_clone, hook_manager.as_ref(), allow_partial)
                     .await;
 
-                queue_clone.task_running.store(false, Ordering::SeqCst);
+                // process_loop clears task_running under the pending lock when the
+                // queue is empty, so we do NOT clear it here. We only clean up the
+                // DashMap entry.
                 queues_map.remove(&network_key);
             });
         }
@@ -110,6 +112,10 @@ impl BatchQueueManager {
 }
 
 /// A single per-network batch queue.
+///
+/// The process_loop runs until the queue is empty. It clears `task_running`
+/// while holding the pending lock, eliminating the race window where an
+/// enqueue between drain and flag-clear could leave items without a processor.
 struct BatchQueue {
     pending: Mutex<Vec<BatchEntry>>,
     max_batch_size: usize,
@@ -132,6 +138,11 @@ impl BatchQueue {
         pending.push(entry);
     }
 
+    /// Run the batch processing loop.
+    ///
+    /// Waits for max_wait_ms, then flushes. Keeps looping as long as items
+    /// remain. Clears `task_running` under the pending lock when the queue
+    /// is empty, so no enqueue can sneak in between drain and flag clear.
     #[cfg(feature = "chain-eip155")]
     async fn process_loop(
         &self,
@@ -139,36 +150,43 @@ impl BatchQueue {
         hook_manager: Option<&Arc<HookManager>>,
         allow_partial_failure: bool,
     ) {
-        // Wait for requests to accumulate
+        // Initial wait for requests to accumulate
         let mut ticker = interval(Duration::from_millis(self.max_wait_ms));
         ticker.tick().await; // first tick is immediate
         ticker.tick().await; // second tick waits max_wait_ms
 
-        // Flush batch
-        let batch = {
-            let mut pending = self.pending.lock().await;
-            if pending.is_empty() {
-                return;
+        loop {
+            // Drain under lock. If empty, clear flag and exit — atomically.
+            let batch = {
+                let mut pending = self.pending.lock().await;
+                if pending.is_empty() {
+                    // Clear task_running WHILE holding the lock.
+                    // Any concurrent enqueue() will see task_running == false
+                    // only after we release the lock, and it will then spawn
+                    // a new worker.
+                    self.task_running.store(false, Ordering::SeqCst);
+                    return;
+                }
+                let batch_size = std::cmp::min(pending.len(), self.max_batch_size);
+                pending.drain(..batch_size).collect::<Vec<_>>()
+            };
+            // Lock released here — new enqueues can happen during processing.
+
+            tracing::info!(batch_size = batch.len(), "Flushing batch settlement");
+
+            if let Err(e) = super::processor::process_batch(
+                provider,
+                batch,
+                hook_manager,
+                allow_partial_failure,
+            )
+            .await
+            {
+                tracing::error!(error = %e, "Batch settlement failed");
             }
-            let batch_size = std::cmp::min(pending.len(), self.max_batch_size);
-            pending.drain(..batch_size).collect::<Vec<_>>()
-        };
 
-        if batch.is_empty() {
-            return;
-        }
-
-        tracing::info!(batch_size = batch.len(), "Flushing batch settlement");
-
-        if let Err(e) = super::processor::process_batch(
-            provider,
-            batch,
-            hook_manager,
-            allow_partial_failure,
-        )
-        .await
-        {
-            tracing::error!(error = %e, "Batch settlement failed");
+            // Loop back to check if more items arrived during processing.
+            // No additional wait — flush immediately if items are pending.
         }
     }
 }
@@ -179,8 +197,6 @@ mod tests {
     use crate::enterprise_config::{BatchSettlementConfig, NetworkBatchConfig};
     use std::collections::HashMap;
 
-    /// Build a BatchSettlementConfig with the given global enabled flag
-    /// and per-network overrides.
     fn make_config(
         global_enabled: bool,
         networks: HashMap<String, NetworkBatchConfig>,
@@ -196,16 +212,10 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // should_batch - global enabled, no per-network overrides
-    // -----------------------------------------------------------------------
-
     #[test]
     fn should_batch_global_enabled_no_overrides() {
         let config = make_config(true, HashMap::new());
         let manager = BatchQueueManager::new(config, None);
-
-        // Any network should be enabled
         assert!(manager.should_batch("base"));
         assert!(manager.should_batch("polygon"));
         assert!(manager.should_batch("unknown-chain"));
@@ -215,15 +225,9 @@ mod tests {
     fn should_batch_global_disabled_no_overrides() {
         let config = make_config(false, HashMap::new());
         let manager = BatchQueueManager::new(config, None);
-
-        // No network should be enabled
         assert!(!manager.should_batch("base"));
         assert!(!manager.should_batch("polygon"));
     }
-
-    // -----------------------------------------------------------------------
-    // should_batch - global disabled, per-network override enables some
-    // -----------------------------------------------------------------------
 
     #[test]
     fn should_batch_global_disabled_network_override_enabled() {
@@ -241,17 +245,10 @@ mod tests {
 
         let config = make_config(false, networks);
         let manager = BatchQueueManager::new(config, None);
-
-        // bsc-testnet is explicitly enabled
         assert!(manager.should_batch("bsc-testnet"));
-        // other networks fall back to global = false
         assert!(!manager.should_batch("base"));
         assert!(!manager.should_batch("polygon"));
     }
-
-    // -----------------------------------------------------------------------
-    // should_batch - global enabled, per-network override disables some
-    // -----------------------------------------------------------------------
 
     #[test]
     fn should_batch_global_enabled_network_override_disabled() {
@@ -269,17 +266,10 @@ mod tests {
 
         let config = make_config(true, networks);
         let manager = BatchQueueManager::new(config, None);
-
-        // polygon is explicitly disabled
         assert!(!manager.should_batch("polygon"));
-        // other networks fall back to global = true
         assert!(manager.should_batch("base"));
         assert!(manager.should_batch("bsc"));
     }
-
-    // -----------------------------------------------------------------------
-    // should_batch - network override with enabled = None falls back to global
-    // -----------------------------------------------------------------------
 
     #[test]
     fn should_batch_network_override_enabled_none_falls_back_to_global() {
@@ -297,8 +287,6 @@ mod tests {
 
         let config = make_config(true, networks);
         let manager = BatchQueueManager::new(config, None);
-
-        // enabled is None -> falls back to global (true)
         assert!(manager.should_batch("base"));
     }
 
@@ -318,14 +306,8 @@ mod tests {
 
         let config = make_config(false, networks);
         let manager = BatchQueueManager::new(config, None);
-
-        // enabled is None -> falls back to global (false)
         assert!(!manager.should_batch("base"));
     }
-
-    // -----------------------------------------------------------------------
-    // active_queues starts at zero
-    // -----------------------------------------------------------------------
 
     #[test]
     fn active_queues_starts_at_zero() {
