@@ -196,9 +196,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let protocol_routes = handlers::routes::<Arc<BatchFacilitator>>()
         .with_state(axum_state.clone());
 
-    // Enterprise landing page
-    let landing_route = Router::new().route("/", get(get_enterprise_root));
-
     // Admin stats route
     let ad_for_stats = abuse_detector.clone();
     let batch_for_stats = axum_state.batch_queue.clone();
@@ -265,9 +262,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }))
     });
 
-    // Compose all routes
+    // Compose all routes (upstream handlers::routes() already registers GET /)
     let mut app = Router::new()
-        .merge(landing_route)
         .merge(protocol_routes)
         .merge(admin_stats_routes);
 
@@ -345,40 +341,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     Ok(())
-}
-
-/// Enterprise landing page with version and endpoint info.
-async fn get_enterprise_root() -> axum::response::Html<String> {
-    let version = env!("CARGO_PKG_VERSION");
-    axum::response::Html(format!(
-        r#"<!DOCTYPE html>
-<html><head><title>x402 Enterprise Facilitator</title>
-<style>body{{font-family:system-ui;max-width:700px;margin:2em auto;line-height:1.6}}
-code{{background:#f0f0f0;padding:2px 6px;border-radius:3px}}
-h1{{border-bottom:2px solid #333}}</style></head>
-<body>
-<h1>x402 Enterprise Facilitator</h1>
-<p>Version: <code>{version}</code></p>
-<h2>Protocol Endpoints</h2>
-<ul>
-<li><code>POST /verify</code> — Verify a payment payload</li>
-<li><code>POST /settle</code> — Settle a verified payment on-chain</li>
-<li><code>GET /supported</code> — List supported payment schemes</li>
-<li><code>GET /health</code> — Health check</li>
-</ul>
-<h2>Admin Endpoints</h2>
-<ul>
-<li><code>GET /admin/stats</code> — Security and batch statistics (requires X-Admin-Key)</li>
-<li><code>GET /admin/hooks</code> — List hook definitions (requires X-Admin-Key)</li>
-<li><code>GET /admin/hooks/mappings</code> — List destination mappings (requires X-Admin-Key)</li>
-<li><code>GET /admin/hooks/status</code> — Hook system status (requires X-Admin-Key)</li>
-<li><code>POST /admin/hooks/reload</code> — Reload hook config (requires X-Admin-Key)</li>
-<li><code>POST /admin/hooks/{{name}}/enable</code> — Enable a hook (requires X-Admin-Key)</li>
-<li><code>POST /admin/hooks/{{name}}/disable</code> — Disable a hook (requires X-Admin-Key)</li>
-<li><code>POST /admin/tokens/reload</code> — Reload token config (requires X-Admin-Key)</li>
-</ul>
-</body></html>"#
-    ))
 }
 
 /// Extract EVM provider Arcs from the chain registry before it's consumed.
