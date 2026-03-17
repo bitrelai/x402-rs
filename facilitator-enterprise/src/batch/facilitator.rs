@@ -241,3 +241,377 @@ impl Facilitator for BatchFacilitator {
         self.inner.supported().await.map_err(Into::into)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::U256;
+
+    /// Helper: build a proto::SettleRequest from a JSON string.
+    fn make_request(json: &str) -> proto::SettleRequest {
+        let raw = serde_json::value::RawValue::from_string(json.to_string()).unwrap();
+        proto::SettleRequest::from(raw)
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_u256_field
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_u256_field_decimal_string() {
+        let val = serde_json::json!("1000000");
+        let result = parse_u256_field(&val).unwrap();
+        assert_eq!(result, U256::from(1_000_000u64));
+    }
+
+    #[test]
+    fn parse_u256_field_hex_string() {
+        let val = serde_json::json!("0xff");
+        let result = parse_u256_field(&val).unwrap();
+        assert_eq!(result, U256::from(255u64));
+    }
+
+    #[test]
+    fn parse_u256_field_number() {
+        let val = serde_json::json!(42u64);
+        let result = parse_u256_field(&val).unwrap();
+        assert_eq!(result, U256::from(42u64));
+    }
+
+    #[test]
+    fn parse_u256_field_zero_string() {
+        let val = serde_json::json!("0");
+        let result = parse_u256_field(&val).unwrap();
+        assert_eq!(result, U256::ZERO);
+    }
+
+    #[test]
+    fn parse_u256_field_large_decimal_string() {
+        // U256 MAX = 115792089237316195423570985008687907853269984665640564039457584007913129639935
+        let max_str = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+        let val = serde_json::json!(max_str);
+        let result = parse_u256_field(&val).unwrap();
+        assert_eq!(result, U256::MAX);
+    }
+
+    #[test]
+    fn parse_u256_field_boolean_returns_none() {
+        let val = serde_json::json!(true);
+        assert!(parse_u256_field(&val).is_none());
+    }
+
+    #[test]
+    fn parse_u256_field_null_returns_none() {
+        let val = serde_json::json!(null);
+        assert!(parse_u256_field(&val).is_none());
+    }
+
+    #[test]
+    fn parse_u256_field_invalid_string_returns_none() {
+        let val = serde_json::json!("not_a_number");
+        assert!(parse_u256_field(&val).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_chain_id
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_chain_id_v2_eip155() {
+        let json = r#"{
+            "x402Version": 2,
+            "paymentPayload": {
+                "accepted": {
+                    "network": "eip155:84532",
+                    "scheme": "exact",
+                    "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+                    "amount": "1000000"
+                },
+                "authorization": {
+                    "from": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "to": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "value": "1000000",
+                    "validAfter": "0",
+                    "validBefore": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+                    "nonce": "0x0000000000000000000000000000000000000000000000000000000000000001"
+                },
+                "signature": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef00"
+            }
+        }"#;
+
+        let request = make_request(json);
+        let chain_id = extract_chain_id(&request).unwrap();
+        assert_eq!(chain_id.namespace, "eip155");
+        assert_eq!(chain_id.reference, "84532");
+    }
+
+    #[test]
+    fn extract_chain_id_v1_network_name() {
+        let json = r#"{
+            "x402Version": 1,
+            "paymentPayload": {
+                "scheme": "exact",
+                "network": "base-sepolia",
+                "payload": {
+                    "signature": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef00",
+                    "authorization": {
+                        "from": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "to": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "value": "1000000",
+                        "validAfter": "0",
+                        "validBefore": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+                        "nonce": "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    }
+                }
+            },
+            "paymentRequirements": {
+                "scheme": "exact",
+                "network": "base-sepolia",
+                "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+                "amount": "1000000",
+                "payTo": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }
+        }"#;
+
+        let request = make_request(json);
+        let chain_id = extract_chain_id(&request).unwrap();
+        assert_eq!(chain_id.namespace, "eip155");
+        assert_eq!(chain_id.reference, "84532");
+    }
+
+    #[test]
+    fn extract_chain_id_invalid_json_returns_none() {
+        let json = r#"{"garbage": true}"#;
+        let request = make_request(json);
+        assert!(extract_chain_id(&request).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // chain_id_to_network_name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn chain_id_to_network_name_known_chain() {
+        let chain_id = ChainId::new("eip155", "84532");
+        assert_eq!(chain_id_to_network_name(&chain_id), "base-sepolia");
+    }
+
+    #[test]
+    fn chain_id_to_network_name_base_mainnet() {
+        let chain_id = ChainId::new("eip155", "8453");
+        assert_eq!(chain_id_to_network_name(&chain_id), "base");
+    }
+
+    #[test]
+    fn chain_id_to_network_name_unknown_chain_returns_chain_id_string() {
+        let chain_id = ChainId::new("eip155", "999999");
+        // Unknown chains should fall back to chain_id.to_string()
+        assert_eq!(chain_id_to_network_name(&chain_id), "eip155:999999");
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_eip3009_metadata - V2 format
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_eip3009_metadata_v2_success() {
+        use alloy::primitives::{address, Address};
+
+        let json = r#"{
+            "x402Version": 2,
+            "paymentPayload": {
+                "accepted": {
+                    "network": "eip155:84532",
+                    "scheme": "exact",
+                    "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+                    "amount": "1000000"
+                },
+                "authorization": {
+                    "from": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "to": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "value": "1000000",
+                    "validAfter": "0",
+                    "validBefore": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+                    "nonce": "0x0000000000000000000000000000000000000000000000000000000000000001"
+                },
+                "signature": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef00"
+            }
+        }"#;
+
+        let request = make_request(json);
+        let meta = extract_eip3009_metadata(&request).unwrap();
+
+        let expected_from: Address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        let expected_to: Address = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".parse().unwrap();
+        let expected_asset: Address = "0x036CbD53842c5426634e7929541eC2318f3dCF7e".parse().unwrap();
+
+        assert_eq!(meta.from, expected_from);
+        assert_eq!(meta.to, expected_to);
+        assert_eq!(meta.value, U256::from(1_000_000u64));
+        assert_eq!(meta.valid_after, U256::ZERO);
+        assert_eq!(meta.valid_before, U256::MAX);
+        assert_eq!(meta.contract_address, expected_asset);
+        // Nonce should be 1
+        assert_eq!(meta.nonce[31], 1u8);
+        // Signature should be 65 bytes
+        assert_eq!(meta.signature.len(), 65);
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_eip3009_metadata - V1 format
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_eip3009_metadata_v1_success() {
+        use alloy::primitives::Address;
+
+        let json = r#"{
+            "x402Version": 1,
+            "paymentPayload": {
+                "scheme": "exact",
+                "network": "base-sepolia",
+                "payload": {
+                    "signature": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef00",
+                    "authorization": {
+                        "from": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "to": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "value": "1000000",
+                        "validAfter": "0",
+                        "validBefore": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+                        "nonce": "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    }
+                }
+            },
+            "paymentRequirements": {
+                "scheme": "exact",
+                "network": "base-sepolia",
+                "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+                "amount": "1000000",
+                "payTo": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }
+        }"#;
+
+        let request = make_request(json);
+        let meta = extract_eip3009_metadata(&request).unwrap();
+
+        let expected_from: Address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        let expected_to: Address = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".parse().unwrap();
+        let expected_asset: Address = "0x036CbD53842c5426634e7929541eC2318f3dCF7e".parse().unwrap();
+
+        assert_eq!(meta.from, expected_from);
+        assert_eq!(meta.to, expected_to);
+        assert_eq!(meta.value, U256::from(1_000_000u64));
+        assert_eq!(meta.valid_after, U256::ZERO);
+        assert_eq!(meta.valid_before, U256::MAX);
+        assert_eq!(meta.contract_address, expected_asset);
+        assert_eq!(meta.nonce[31], 1u8);
+        assert_eq!(meta.signature.len(), 65);
+    }
+
+    #[test]
+    fn extract_eip3009_metadata_missing_authorization_returns_none() {
+        let json = r#"{
+            "x402Version": 2,
+            "paymentPayload": {
+                "accepted": {
+                    "network": "eip155:84532",
+                    "scheme": "exact",
+                    "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+                    "amount": "1000000"
+                },
+                "signature": "0xdeadbeef"
+            }
+        }"#;
+
+        let request = make_request(json);
+        // No authorization block -> None
+        assert!(extract_eip3009_metadata(&request).is_none());
+    }
+
+    #[test]
+    fn extract_eip3009_metadata_invalid_address_returns_none() {
+        let json = r#"{
+            "x402Version": 2,
+            "paymentPayload": {
+                "accepted": {
+                    "network": "eip155:84532",
+                    "scheme": "exact",
+                    "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+                    "amount": "1000000"
+                },
+                "authorization": {
+                    "from": "not_an_address",
+                    "to": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "value": "1000000",
+                    "validAfter": "0",
+                    "validBefore": "1",
+                    "nonce": "0x0000000000000000000000000000000000000000000000000000000000000001"
+                },
+                "signature": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef00"
+            }
+        }"#;
+
+        let request = make_request(json);
+        assert!(extract_eip3009_metadata(&request).is_none());
+    }
+
+    #[test]
+    fn extract_eip3009_metadata_garbage_json_returns_none() {
+        let json = r#"{"random": "data"}"#;
+        let request = make_request(json);
+        assert!(extract_eip3009_metadata(&request).is_none());
+    }
+
+    #[test]
+    fn extract_eip3009_metadata_v1_missing_payment_requirements_returns_none() {
+        // V1 format but missing paymentRequirements -> cannot find asset
+        let json = r#"{
+            "x402Version": 1,
+            "paymentPayload": {
+                "scheme": "exact",
+                "network": "base-sepolia",
+                "payload": {
+                    "signature": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef00",
+                    "authorization": {
+                        "from": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "to": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "value": "1000000",
+                        "validAfter": "0",
+                        "validBefore": "1",
+                        "nonce": "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    }
+                }
+            }
+        }"#;
+
+        let request = make_request(json);
+        assert!(extract_eip3009_metadata(&request).is_none());
+    }
+
+    #[test]
+    fn extract_eip3009_metadata_v2_missing_asset_returns_none() {
+        // V2 format but accepted block has no "asset"
+        let json = r#"{
+            "x402Version": 2,
+            "paymentPayload": {
+                "accepted": {
+                    "network": "eip155:84532",
+                    "scheme": "exact",
+                    "amount": "1000000"
+                },
+                "authorization": {
+                    "from": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "to": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "value": "1000000",
+                    "validAfter": "0",
+                    "validBefore": "1",
+                    "nonce": "0x0000000000000000000000000000000000000000000000000000000000000001"
+                },
+                "signature": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef00"
+            }
+        }"#;
+
+        let request = make_request(json);
+        assert!(extract_eip3009_metadata(&request).is_none());
+    }
+}

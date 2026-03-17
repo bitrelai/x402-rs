@@ -172,3 +172,165 @@ impl BatchQueue {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::enterprise_config::{BatchSettlementConfig, NetworkBatchConfig};
+    use std::collections::HashMap;
+
+    /// Build a BatchSettlementConfig with the given global enabled flag
+    /// and per-network overrides.
+    fn make_config(
+        global_enabled: bool,
+        networks: HashMap<String, NetworkBatchConfig>,
+    ) -> BatchSettlementConfig {
+        BatchSettlementConfig {
+            enabled: global_enabled,
+            max_batch_size: 150,
+            max_wait_ms: 500,
+            min_batch_size: 10,
+            allow_partial_failure: false,
+            allow_hook_failure: false,
+            networks,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // should_batch - global enabled, no per-network overrides
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn should_batch_global_enabled_no_overrides() {
+        let config = make_config(true, HashMap::new());
+        let manager = BatchQueueManager::new(config, None);
+
+        // Any network should be enabled
+        assert!(manager.should_batch("base"));
+        assert!(manager.should_batch("polygon"));
+        assert!(manager.should_batch("unknown-chain"));
+    }
+
+    #[test]
+    fn should_batch_global_disabled_no_overrides() {
+        let config = make_config(false, HashMap::new());
+        let manager = BatchQueueManager::new(config, None);
+
+        // No network should be enabled
+        assert!(!manager.should_batch("base"));
+        assert!(!manager.should_batch("polygon"));
+    }
+
+    // -----------------------------------------------------------------------
+    // should_batch - global disabled, per-network override enables some
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn should_batch_global_disabled_network_override_enabled() {
+        let mut networks = HashMap::new();
+        networks.insert(
+            "bsc-testnet".to_string(),
+            NetworkBatchConfig {
+                enabled: Some(true),
+                max_batch_size: Some(100),
+                max_wait_ms: None,
+                min_batch_size: None,
+                allow_partial_failure: None,
+            },
+        );
+
+        let config = make_config(false, networks);
+        let manager = BatchQueueManager::new(config, None);
+
+        // bsc-testnet is explicitly enabled
+        assert!(manager.should_batch("bsc-testnet"));
+        // other networks fall back to global = false
+        assert!(!manager.should_batch("base"));
+        assert!(!manager.should_batch("polygon"));
+    }
+
+    // -----------------------------------------------------------------------
+    // should_batch - global enabled, per-network override disables some
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn should_batch_global_enabled_network_override_disabled() {
+        let mut networks = HashMap::new();
+        networks.insert(
+            "polygon".to_string(),
+            NetworkBatchConfig {
+                enabled: Some(false),
+                max_batch_size: None,
+                max_wait_ms: None,
+                min_batch_size: None,
+                allow_partial_failure: None,
+            },
+        );
+
+        let config = make_config(true, networks);
+        let manager = BatchQueueManager::new(config, None);
+
+        // polygon is explicitly disabled
+        assert!(!manager.should_batch("polygon"));
+        // other networks fall back to global = true
+        assert!(manager.should_batch("base"));
+        assert!(manager.should_batch("bsc"));
+    }
+
+    // -----------------------------------------------------------------------
+    // should_batch - network override with enabled = None falls back to global
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn should_batch_network_override_enabled_none_falls_back_to_global() {
+        let mut networks = HashMap::new();
+        networks.insert(
+            "base".to_string(),
+            NetworkBatchConfig {
+                enabled: None,
+                max_batch_size: Some(200),
+                max_wait_ms: None,
+                min_batch_size: None,
+                allow_partial_failure: None,
+            },
+        );
+
+        let config = make_config(true, networks);
+        let manager = BatchQueueManager::new(config, None);
+
+        // enabled is None -> falls back to global (true)
+        assert!(manager.should_batch("base"));
+    }
+
+    #[test]
+    fn should_batch_network_override_enabled_none_global_disabled() {
+        let mut networks = HashMap::new();
+        networks.insert(
+            "base".to_string(),
+            NetworkBatchConfig {
+                enabled: None,
+                max_batch_size: Some(200),
+                max_wait_ms: None,
+                min_batch_size: None,
+                allow_partial_failure: None,
+            },
+        );
+
+        let config = make_config(false, networks);
+        let manager = BatchQueueManager::new(config, None);
+
+        // enabled is None -> falls back to global (false)
+        assert!(!manager.should_batch("base"));
+    }
+
+    // -----------------------------------------------------------------------
+    // active_queues starts at zero
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn active_queues_starts_at_zero() {
+        let config = make_config(true, HashMap::new());
+        let manager = BatchQueueManager::new(config, None);
+        assert_eq!(manager.active_queues(), 0);
+    }
+}

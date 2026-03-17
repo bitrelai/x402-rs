@@ -169,3 +169,143 @@ impl FromStr for EvmPrivateKey {
             .map_err(|e| format!("Invalid evm private key: {}", e))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A valid 32-byte hex private key for test purposes.
+    const TEST_KEY: &str =
+        "0xcafe000000000000000000000000000000000000000000000000000000000001";
+
+    /// Build a minimal JSON config with the given ordered_fallback value.
+    /// If `ordered_fallback` is None, the field is omitted entirely.
+    fn make_config_json(ordered_fallback: Option<bool>) -> String {
+        let of_field = match ordered_fallback {
+            Some(val) => format!(r#", "ordered_fallback": {}"#, val),
+            None => String::new(),
+        };
+
+        format!(
+            r#"{{
+                "signers": ["{}"],
+                "rpc": [
+                    {{ "http": "https://rpc.example.com" }}
+                ]{}
+            }}"#,
+            TEST_KEY, of_field
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // ordered_fallback: defaults to None when not present
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ordered_fallback_defaults_to_none() {
+        let json = make_config_json(None);
+        let config: Eip155ChainConfigInner = serde_json::from_str(&json).unwrap();
+        assert_eq!(config.ordered_fallback, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // ordered_fallback: parses as Some(true)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ordered_fallback_parses_true() {
+        let json = make_config_json(Some(true));
+        let config: Eip155ChainConfigInner = serde_json::from_str(&json).unwrap();
+        assert_eq!(config.ordered_fallback, Some(true));
+    }
+
+    // -----------------------------------------------------------------------
+    // ordered_fallback: parses as Some(false)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ordered_fallback_parses_false() {
+        let json = make_config_json(Some(false));
+        let config: Eip155ChainConfigInner = serde_json::from_str(&json).unwrap();
+        assert_eq!(config.ordered_fallback, Some(false));
+    }
+
+    // -----------------------------------------------------------------------
+    // Other defaults: eip1559, flashblocks, receipt_timeout_secs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_eip1559_is_true() {
+        let json = make_config_json(None);
+        let config: Eip155ChainConfigInner = serde_json::from_str(&json).unwrap();
+        assert!(config.eip1559);
+    }
+
+    #[test]
+    fn default_flashblocks_is_false() {
+        let json = make_config_json(None);
+        let config: Eip155ChainConfigInner = serde_json::from_str(&json).unwrap();
+        assert!(!config.flashblocks);
+    }
+
+    #[test]
+    fn default_receipt_timeout_secs() {
+        let json = make_config_json(None);
+        let config: Eip155ChainConfigInner = serde_json::from_str(&json).unwrap();
+        assert_eq!(config.receipt_timeout_secs, 30);
+    }
+
+    // -----------------------------------------------------------------------
+    // RPC config parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rpc_config_with_rate_limit() {
+        let json = format!(
+            r#"{{
+                "signers": ["{}"],
+                "rpc": [
+                    {{ "http": "https://rpc.example.com", "rate_limit": 100 }}
+                ]
+            }}"#,
+            TEST_KEY
+        );
+
+        let config: Eip155ChainConfigInner = serde_json::from_str(&json).unwrap();
+        assert_eq!(config.rpc.len(), 1);
+        assert_eq!(config.rpc[0].rate_limit, Some(100));
+    }
+
+    #[test]
+    fn rpc_config_without_rate_limit() {
+        let json = format!(
+            r#"{{
+                "signers": ["{}"],
+                "rpc": [
+                    {{ "http": "https://rpc.example.com" }}
+                ]
+            }}"#,
+            TEST_KEY
+        );
+
+        let config: Eip155ChainConfigInner = serde_json::from_str(&json).unwrap();
+        assert_eq!(config.rpc[0].rate_limit, None);
+    }
+
+    #[test]
+    fn multiple_rpc_endpoints() {
+        let json = format!(
+            r#"{{
+                "signers": ["{}"],
+                "rpc": [
+                    {{ "http": "https://rpc1.example.com" }},
+                    {{ "http": "https://rpc2.example.com", "rate_limit": 50 }}
+                ]
+            }}"#,
+            TEST_KEY
+        );
+
+        let config: Eip155ChainConfigInner = serde_json::from_str(&json).unwrap();
+        assert_eq!(config.rpc.len(), 2);
+    }
+}

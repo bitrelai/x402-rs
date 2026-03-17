@@ -188,3 +188,180 @@ impl SignerAddresses for Eip155ChainProvider {
         x402_types::chain::ChainProviderOps::signer_addresses(self)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::{address, bytes, fixed_bytes, U256};
+    use alloy::sol_types::SolCall;
+
+    /// Create a sample SettlementMetadata for testing.
+    fn sample_metadata() -> SettlementMetadata {
+        SettlementMetadata {
+            from: address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            to: address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            value: U256::from(1_000_000u64),
+            valid_after: U256::ZERO,
+            valid_before: U256::MAX,
+            nonce: fixed_bytes!("0000000000000000000000000000000000000000000000000000000000000001"),
+            signature: bytes!("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef00"),
+            contract_address: address!("036CbD53842c5426634e7929541eC2318f3dCF7e"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // build_transfer_call3
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_transfer_call3_target_is_contract_address() {
+        let meta = sample_metadata();
+        let call3 = build_transfer_call3(&meta, false);
+        assert_eq!(call3.target, meta.contract_address);
+    }
+
+    #[test]
+    fn build_transfer_call3_allow_failure_false() {
+        let meta = sample_metadata();
+        let call3 = build_transfer_call3(&meta, false);
+        assert!(!call3.allowFailure);
+    }
+
+    #[test]
+    fn build_transfer_call3_allow_failure_true() {
+        let meta = sample_metadata();
+        let call3 = build_transfer_call3(&meta, true);
+        assert!(call3.allowFailure);
+    }
+
+    #[test]
+    fn build_transfer_call3_calldata_starts_with_selector() {
+        let meta = sample_metadata();
+        let call3 = build_transfer_call3(&meta, false);
+
+        // transferWithAuthorization selector: first 4 bytes of keccak256 of the function signature
+        // The calldata must be at least 4 bytes (selector) + encoded parameters
+        assert!(call3.callData.len() > 4);
+
+        // The calldata should be decodable as transferWithAuthorizationCall
+        let decoded = multicall3::transferWithAuthorizationCall::abi_decode(&call3.callData);
+        assert!(decoded.is_ok(), "calldata should decode as transferWithAuthorizationCall");
+
+        let decoded = decoded.unwrap();
+        assert_eq!(decoded.from, meta.from);
+        assert_eq!(decoded.to, meta.to);
+        assert_eq!(decoded.value, meta.value);
+        assert_eq!(decoded.validAfter, meta.valid_after);
+        assert_eq!(decoded.validBefore, meta.valid_before);
+        assert_eq!(decoded.nonce, meta.nonce);
+        assert_eq!(decoded.signature, meta.signature);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_hook_call3
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_hook_call3_maps_fields_correctly() {
+        let hook = HookCall {
+            target: address!("CcCCccCCccCCccCCccCCccCCccCCccCCccCCccCC"),
+            calldata: bytes!("aabbccdd"),
+            gas_limit: 100_000,
+            allow_failure: true,
+        };
+
+        let call3 = build_hook_call3(&hook);
+        assert_eq!(call3.target, hook.target);
+        assert_eq!(call3.callData, hook.calldata);
+        assert!(call3.allowFailure);
+    }
+
+    #[test]
+    fn build_hook_call3_allow_failure_false() {
+        let hook = HookCall {
+            target: address!("DdDDddDDddDDddDDddDDddDDddDDddDDddDDddDD"),
+            calldata: bytes!("11223344"),
+            gas_limit: 50_000,
+            allow_failure: false,
+        };
+
+        let call3 = build_hook_call3(&hook);
+        assert!(!call3.allowFailure);
+    }
+
+    // -----------------------------------------------------------------------
+    // Multicall3 aggregate3 encoding
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn aggregate3_encoding_single_transfer() {
+        let meta = sample_metadata();
+        let call3 = build_transfer_call3(&meta, false);
+
+        let aggregate = IMulticall3::aggregate3Call {
+            calls: vec![call3],
+        };
+        let encoded = aggregate.abi_encode();
+
+        // Should have the aggregate3 selector (4 bytes) plus encoded data
+        assert!(encoded.len() > 4);
+        // Reasonable size: selector(4) + offset(32) + length(32) + at least one Call3 struct
+        assert!(encoded.len() > 100, "encoded aggregate3 should be a reasonable size, got {} bytes", encoded.len());
+    }
+
+    #[test]
+    fn aggregate3_encoding_multiple_calls() {
+        let meta = sample_metadata();
+        let transfer_call = build_transfer_call3(&meta, true);
+
+        let hook = HookCall {
+            target: address!("CcCCccCCccCCccCCccCCccCCccCCccCCccCCccCC"),
+            calldata: bytes!("aabbccdd"),
+            gas_limit: 100_000,
+            allow_failure: true,
+        };
+        let hook_call = build_hook_call3(&hook);
+
+        let aggregate = IMulticall3::aggregate3Call {
+            calls: vec![transfer_call, hook_call],
+        };
+        let encoded = aggregate.abi_encode();
+
+        // With two calls, encoded data should be larger than with one
+        let single_meta = sample_metadata();
+        let single_call = build_transfer_call3(&single_meta, true);
+        let single_aggregate = IMulticall3::aggregate3Call {
+            calls: vec![single_call],
+        };
+        let single_encoded = single_aggregate.abi_encode();
+
+        assert!(
+            encoded.len() > single_encoded.len(),
+            "two-call encoding ({} bytes) should be larger than single-call ({} bytes)",
+            encoded.len(),
+            single_encoded.len()
+        );
+    }
+
+    #[test]
+    fn aggregate3_encoding_roundtrip() {
+        let meta = sample_metadata();
+        let call3 = build_transfer_call3(&meta, false);
+        let target = call3.target;
+        let allow_failure = call3.allowFailure;
+        let calldata_len = call3.callData.len();
+
+        let aggregate = IMulticall3::aggregate3Call {
+            calls: vec![call3],
+        };
+        let encoded = aggregate.abi_encode();
+
+        // Decode and verify
+        let decoded = IMulticall3::aggregate3Call::abi_decode(&encoded)
+            .expect("should decode aggregate3 calldata");
+        assert_eq!(decoded.calls.len(), 1);
+        assert_eq!(decoded.calls[0].target, target);
+        assert_eq!(decoded.calls[0].allowFailure, allow_failure);
+        assert_eq!(decoded.calls[0].callData.len(), calldata_len);
+    }
+}

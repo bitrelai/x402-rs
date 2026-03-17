@@ -245,3 +245,157 @@ impl Deref for SolanaSignerConfig {
         self.0.inner()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Generate a valid base58-encoded 64-byte Solana keypair for test configs.
+    fn test_keypair_base58() -> String {
+        // Use solana_keypair to generate a valid keypair for testing
+        let keypair = solana_keypair::Keypair::new();
+        bs58::encode(keypair.to_bytes()).into_string()
+    }
+
+    // -----------------------------------------------------------------------
+    // one_or_many_url: single URL string deserializes to Vec with 1 element
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn one_or_many_url_single_string() {
+        let key = test_keypair_base58();
+        let json = format!(
+            r#"{{
+                "signer": "{}",
+                "rpc": "https://api.mainnet-beta.solana.com"
+            }}"#,
+            key
+        );
+
+        let config: SolanaChainConfigInner = serde_json::from_str(&json).unwrap();
+        assert_eq!(config.rpc.len(), 1);
+        assert_eq!(
+            config.rpc[0].as_str(),
+            "https://api.mainnet-beta.solana.com/"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // one_or_many_url: array of URLs deserializes to Vec with multiple elements
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn one_or_many_url_array_of_strings() {
+        let key = test_keypair_base58();
+        let json = format!(
+            r#"{{
+                "signer": "{}",
+                "rpc": [
+                    "https://api.mainnet-beta.solana.com",
+                    "https://rpc.ankr.com/solana"
+                ]
+            }}"#,
+            key
+        );
+
+        let config: SolanaChainConfigInner = serde_json::from_str(&json).unwrap();
+        assert_eq!(config.rpc.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // one_or_many_url: empty array is rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn one_or_many_url_empty_array_rejected() {
+        let key = test_keypair_base58();
+        let json = format!(
+            r#"{{
+                "signer": "{}",
+                "rpc": []
+            }}"#,
+            key
+        );
+
+        let result = serde_json::from_str::<SolanaChainConfigInner>(&json);
+        assert!(result.is_err(), "empty rpc array should be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("must not be empty"),
+            "error should mention 'must not be empty', got: {}",
+            err_msg
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Default compute budget values
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_compute_budget_values() {
+        let key = test_keypair_base58();
+        let json = format!(
+            r#"{{
+                "signer": "{}",
+                "rpc": "https://api.mainnet-beta.solana.com"
+            }}"#,
+            key
+        );
+
+        let config: SolanaChainConfigInner = serde_json::from_str(&json).unwrap();
+        assert_eq!(config.max_compute_unit_limit, 400_000);
+        assert_eq!(config.max_compute_unit_price, 1_000_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Serialization roundtrip: single URL serializes as plain string
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn serialize_single_url_as_string() {
+        let key = test_keypair_base58();
+        let json = format!(
+            r#"{{
+                "signer": "{}",
+                "rpc": "https://api.mainnet-beta.solana.com"
+            }}"#,
+            key
+        );
+
+        let config: SolanaChainConfigInner = serde_json::from_str(&json).unwrap();
+        let serialized = serde_json::to_value(&config).unwrap();
+
+        // Single URL should serialize as a plain string, not an array
+        assert!(
+            serialized["rpc"].is_string(),
+            "single rpc URL should serialize as string, got: {:?}",
+            serialized["rpc"]
+        );
+    }
+
+    #[test]
+    fn serialize_multiple_urls_as_array() {
+        let key = test_keypair_base58();
+        let json = format!(
+            r#"{{
+                "signer": "{}",
+                "rpc": [
+                    "https://api.mainnet-beta.solana.com",
+                    "https://rpc.ankr.com/solana"
+                ]
+            }}"#,
+            key
+        );
+
+        let config: SolanaChainConfigInner = serde_json::from_str(&json).unwrap();
+        let serialized = serde_json::to_value(&config).unwrap();
+
+        // Multiple URLs should serialize as an array
+        assert!(
+            serialized["rpc"].is_array(),
+            "multiple rpc URLs should serialize as array, got: {:?}",
+            serialized["rpc"]
+        );
+        assert_eq!(serialized["rpc"].as_array().unwrap().len(), 2);
+    }
+}
