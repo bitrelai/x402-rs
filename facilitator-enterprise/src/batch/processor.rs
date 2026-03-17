@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, Bytes, U256, b256};
 use alloy::sol_types::SolCall;
 use std::sync::Arc;
 
@@ -8,6 +8,10 @@ use crate::hooks::{HookCall, HookManager, RuntimeContext};
 
 #[cfg(feature = "chain-eip155")]
 use x402_chain_eip155::chain::{Eip155ChainProvider, Eip155MetaTransactionProvider, MetaTransaction};
+
+/// ERC-20 Transfer event signature: keccak256("Transfer(address,address,uint256)")
+const TRANSFER_EVENT_SIGNATURE: alloy::primitives::B256 =
+    b256!("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef");
 
 /// A single entry in the batch queue waiting for settlement.
 pub struct BatchEntry {
@@ -73,11 +77,78 @@ fn build_hook_call3(hook: &HookCall) -> IMulticall3::Call3 {
     }
 }
 
+/// Parse ERC-20 Transfer event logs from a receipt to determine per-settlement success.
+///
+/// Each successful `transferWithAuthorization` emits a `Transfer(from, to, value)` event.
+/// We match these against the settlement metadata to determine which settlements succeeded.
+/// When `allow_partial_failure` is true, some settlements may fail without reverting the batch.
+#[cfg(feature = "chain-eip155")]
+fn parse_per_settlement_results(
+    receipt: &alloy::rpc::types::TransactionReceipt,
+    entries: &[&BatchEntry],
+) -> Vec<bool> {
+    if !receipt.status() {
+        // Entire transaction reverted — all settlements failed
+        return vec![false; entries.len()];
+    }
+
+    // Parse Transfer events from logs
+    let mut transfer_events: Vec<(Address, Address, U256)> = Vec::new();
+    if let Some(receipt_inner) = receipt.inner.as_receipt() {
+        for log in &receipt_inner.logs {
+            if log.topics().len() >= 3 && log.topics()[0] == TRANSFER_EVENT_SIGNATURE {
+                let from = Address::from_word(log.topics()[1]);
+                let to = Address::from_word(log.topics()[2]);
+                let value = if log.data().data.len() >= 32 {
+                    U256::from_be_slice(&log.data().data[..32])
+                } else {
+                    U256::ZERO
+                };
+                transfer_events.push((from, to, value));
+            }
+        }
+    }
+
+    tracing::debug!(
+        transfer_count = transfer_events.len(),
+        expected_count = entries.len(),
+        "parsed Transfer events from batch settlement receipt"
+    );
+
+    // Match each settlement to a Transfer event by (from, to, value)
+    entries
+        .iter()
+        .map(|entry| {
+            transfer_events.iter().any(|(from, to, value)| {
+                *from == entry.metadata.from
+                    && *to == entry.metadata.to
+                    && *value == entry.metadata.value
+            })
+        })
+        .collect()
+}
+
+/// Maximum Call3 structs per Multicall3 transaction.
+/// Each settlement needs 1 Call3 for the transfer + N for hooks.
+/// Limited by block gas limit (~30M gas / ~55k per transfer ≈ 545 theoretical max).
+/// Conservative default matching infra402.
+const MAX_CALL3_PER_BATCH: usize = 150;
+
+/// A prepared settlement with its Call3 entries and the original BatchEntry.
+struct PreparedSettlement {
+    calls: Vec<IMulticall3::Call3>,
+    entry_index: usize,
+}
+
 /// Process a batch of settlements via Multicall3.
 ///
-/// Builds Call3 entries for each settlement (transfer + hooks), encodes an
-/// `aggregate3()` call, and submits it through the upstream provider's
-/// `send_transaction(MetaTransaction)` API.
+/// 1. Builds Call3 entries per settlement (transfer + hooks)
+/// 2. Splits into sub-batches when Call3 count exceeds MAX_CALL3_PER_BATCH
+/// 3. Submits each sub-batch as a separate Multicall3 transaction
+/// 4. Parses per-settlement results from ERC-20 Transfer event logs
+/// 5. Routes results back to callers via oneshot channels
+///
+/// Uses real block context for hook runtime parameters.
 #[cfg(feature = "chain-eip155")]
 pub async fn process_batch(
     provider: &Arc<Eip155ChainProvider>,
@@ -89,9 +160,6 @@ pub async fn process_batch(
         return Err(BatchError::Encoding("empty batch".into()));
     }
 
-    let mut all_calls: Vec<IMulticall3::Call3> = Vec::new();
-    let mut entry_call_ranges: Vec<(usize, usize)> = Vec::new(); // (start, count) per entry
-
     // Get the first signer address for runtime context
     let signer_addresses = provider.signer_addresses();
     let sender = signer_addresses
@@ -99,19 +167,26 @@ pub async fn process_batch(
         .and_then(|s| s.parse::<Address>().ok())
         .unwrap_or(Address::ZERO);
 
-    for entry in &entries {
-        let start = all_calls.len();
+    // Fetch real block context for hook runtime parameters
+    let runtime = match RuntimeContext::from_provider(provider.inner(), sender).await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to fetch block context for hooks, using zeros");
+            RuntimeContext::new(U256::ZERO, U256::ZERO, sender)
+        }
+    };
 
-        // Add transfer Call3
-        all_calls.push(build_transfer_call3(&entry.metadata, allow_partial_failure));
+    // Prepare Call3 entries for each settlement
+    let mut prepared: Vec<PreparedSettlement> = Vec::with_capacity(entries.len());
+    for (idx, entry) in entries.iter().enumerate() {
+        let mut calls = Vec::new();
 
-        // Add hook Call3s if hook manager is available
+        // Transfer Call3
+        calls.push(build_transfer_call3(&entry.metadata, allow_partial_failure));
+
+        // Hook Call3s
         if let Some(hm) = hook_manager {
-            let runtime = RuntimeContext::new(
-                U256::ZERO, // Will be filled by block at execution time
-                U256::ZERO,
-                sender,
-            );
+            let hook_runtime = runtime.clone().with_batch_info(idx, entries.len());
 
             match hm
                 .get_hooks_for_destination_with_context(
@@ -119,13 +194,13 @@ pub async fn process_batch(
                     entry.metadata.contract_address,
                     &entry.network,
                     &entry.metadata,
-                    &runtime,
+                    &hook_runtime,
                 )
                 .await
             {
                 Ok(hooks) => {
                     for hook in &hooks {
-                        all_calls.push(build_hook_call3(hook));
+                        calls.push(build_hook_call3(hook));
                     }
                 }
                 Err(e) => {
@@ -135,45 +210,157 @@ pub async fn process_batch(
             }
         }
 
-        let count = all_calls.len() - start;
-        entry_call_ranges.push((start, count));
+        prepared.push(PreparedSettlement {
+            calls,
+            entry_index: idx,
+        });
     }
 
-    // Encode Multicall3 aggregate3() calldata
-    let aggregate_call = IMulticall3::aggregate3Call {
-        calls: all_calls,
-    };
-    let calldata = Bytes::from(aggregate_call.abi_encode());
+    // Split into sub-batches based on Call3 count (matching infra402 logic).
+    // Each settlement's calls (transfer + hooks) stay together — never split across batches.
+    let mut sub_batches: Vec<Vec<usize>> = Vec::new(); // indices into `prepared`
+    let mut current_batch: Vec<usize> = Vec::new();
+    let mut current_call3_count = 0;
 
-    // Submit via upstream provider's MetaTransaction API
-    let meta_tx = MetaTransaction::new(MULTICALL3_ADDRESS, calldata);
+    for (i, p) in prepared.iter().enumerate() {
+        let calls_needed = p.calls.len();
 
-    let receipt = provider
-        .send_transaction(meta_tx)
-        .await
-        .map_err(|e| BatchError::Transaction(e.to_string()))?;
+        if current_call3_count + calls_needed > MAX_CALL3_PER_BATCH && !current_batch.is_empty() {
+            sub_batches.push(current_batch);
+            current_batch = Vec::new();
+            current_call3_count = 0;
+        }
 
-    let tx_hash = format!("{:?}", receipt.transaction_hash);
-    let batch_success = receipt.status();
+        current_batch.push(i);
+        current_call3_count += calls_needed;
+    }
+    if !current_batch.is_empty() {
+        sub_batches.push(current_batch);
+    }
 
     tracing::info!(
-        tx_hash = %tx_hash,
-        success = batch_success,
-        entries = entries.len(),
-        "Batch settlement transaction submitted"
+        total_entries = entries.len(),
+        sub_batch_count = sub_batches.len(),
+        "Split batch into {} sub-batches based on Call3 limits",
+        sub_batches.len()
     );
 
-    // Route results back to callers
-    for (i, entry) in entries.into_iter().enumerate() {
-        let result = BatchSettleResult {
-            success: batch_success,
-            tx_hash: tx_hash.clone(),
-        };
-        let _ = entry.response_tx.send(Ok(result));
-        let _ = i; // suppress unused warning
+    // Regroup entries into sub-batches for sequential processing.
+    // Each sub-batch is a Vec of (BatchEntry, Vec<Call3>).
+    let mut entries_with_calls: Vec<(BatchEntry, Vec<IMulticall3::Call3>)> = entries
+        .into_iter()
+        .zip(prepared.into_iter())
+        .map(|(entry, p)| (entry, p.calls))
+        .collect();
+
+    let mut sub_batch_ranges: Vec<(usize, usize)> = Vec::new(); // (start, len) into entries_with_calls
+    {
+        let mut start = 0;
+        let mut call3_count = 0;
+        for (i, (_, calls)) in entries_with_calls.iter().enumerate() {
+            let needed = calls.len();
+            if call3_count + needed > MAX_CALL3_PER_BATCH && i > start {
+                sub_batch_ranges.push((start, i - start));
+                start = i;
+                call3_count = 0;
+            }
+            call3_count += needed;
+        }
+        if start < entries_with_calls.len() {
+            sub_batch_ranges.push((start, entries_with_calls.len() - start));
+        }
     }
 
-    Ok(tx_hash)
+    tracing::info!(
+        total_entries = entries_with_calls.len(),
+        sub_batch_count = sub_batch_ranges.len(),
+        "Split batch into {} sub-batches based on Call3 limits",
+        sub_batch_ranges.len()
+    );
+
+    // Process sub-batches in reverse order so we can drain from the end without
+    // invalidating indices. Actually, simpler: drain the whole vec into sub-batch vecs.
+    let mut sub_batches: Vec<Vec<(BatchEntry, Vec<IMulticall3::Call3>)>> = Vec::new();
+    for &(start, len) in sub_batch_ranges.iter().rev() {
+        let sub: Vec<_> = entries_with_calls.drain(start..start + len).collect();
+        sub_batches.push(sub);
+    }
+    sub_batches.reverse();
+
+    let mut last_tx_hash = String::new();
+
+    for (batch_num, sub_batch) in sub_batches.into_iter().enumerate() {
+        // Collect all Call3s for this sub-batch
+        let mut all_calls: Vec<IMulticall3::Call3> = Vec::new();
+        for (_, calls) in &sub_batch {
+            all_calls.extend(calls.iter().cloned());
+        }
+
+        let total_call3s = all_calls.len();
+        tracing::info!(
+            batch_num,
+            settlements = sub_batch.len(),
+            total_call3s,
+            "Processing sub-batch"
+        );
+
+        // Encode and submit
+        let aggregate_call = IMulticall3::aggregate3Call { calls: all_calls };
+        let calldata = Bytes::from(aggregate_call.abi_encode());
+        let meta_tx = MetaTransaction::new(MULTICALL3_ADDRESS, calldata);
+
+        match provider.send_transaction(meta_tx).await {
+            Ok(receipt) => {
+                let tx_hash = format!("{:?}", receipt.transaction_hash);
+
+                tracing::info!(
+                    tx_hash = %tx_hash,
+                    success = receipt.status(),
+                    settlements = sub_batch.len(),
+                    "Sub-batch transaction submitted"
+                );
+
+                // Parse per-settlement results from Transfer event logs
+                // We need BatchEntry refs for the metadata matching
+                let dummy_entries: Vec<BatchEntry> = sub_batch
+                    .iter()
+                    .map(|(e, _)| BatchEntry {
+                        metadata: e.metadata.clone(),
+                        network: e.network.clone(),
+                        response_tx: tokio::sync::oneshot::channel().0, // dummy
+                    })
+                    .collect();
+                let entry_refs: Vec<&BatchEntry> = dummy_entries.iter().collect();
+                let per_success = parse_per_settlement_results(&receipt, &entry_refs);
+
+                // Route results back to callers
+                for (pos, (entry, _)) in sub_batch.into_iter().enumerate() {
+                    let success = per_success.get(pos).copied().unwrap_or(false);
+                    let result = BatchSettleResult {
+                        success,
+                        tx_hash: tx_hash.clone(),
+                    };
+                    let _ = entry.response_tx.send(Ok(result));
+                }
+
+                last_tx_hash = tx_hash;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, batch_num, "Sub-batch transaction failed");
+
+                // Send error to all entries in this sub-batch
+                for (entry, _) in sub_batch {
+                    let _ = entry.response_tx.send(Err(BatchError::Transaction(
+                        format!("Sub-batch {} failed: {}", batch_num, e),
+                    )));
+                }
+
+                return Err(BatchError::Transaction(e.to_string()));
+            }
+        }
+    }
+
+    Ok(last_tx_hash)
 }
 
 /// Signer addresses accessor (needed since the trait method returns Vec<String>).
@@ -209,10 +396,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // build_transfer_call3
-    // -----------------------------------------------------------------------
-
     #[test]
     fn build_transfer_call3_target_is_contract_address() {
         let meta = sample_metadata();
@@ -239,11 +422,8 @@ mod tests {
         let meta = sample_metadata();
         let call3 = build_transfer_call3(&meta, false);
 
-        // transferWithAuthorization selector: first 4 bytes of keccak256 of the function signature
-        // The calldata must be at least 4 bytes (selector) + encoded parameters
         assert!(call3.callData.len() > 4);
 
-        // The calldata should be decodable as transferWithAuthorizationCall
         let decoded = multicall3::transferWithAuthorizationCall::abi_decode(&call3.callData);
         assert!(decoded.is_ok(), "calldata should decode as transferWithAuthorizationCall");
 
@@ -256,10 +436,6 @@ mod tests {
         assert_eq!(decoded.nonce, meta.nonce);
         assert_eq!(decoded.signature, meta.signature);
     }
-
-    // -----------------------------------------------------------------------
-    // build_hook_call3
-    // -----------------------------------------------------------------------
 
     #[test]
     fn build_hook_call3_maps_fields_correctly() {
@@ -289,10 +465,6 @@ mod tests {
         assert!(!call3.allowFailure);
     }
 
-    // -----------------------------------------------------------------------
-    // Multicall3 aggregate3 encoding
-    // -----------------------------------------------------------------------
-
     #[test]
     fn aggregate3_encoding_single_transfer() {
         let meta = sample_metadata();
@@ -303,9 +475,7 @@ mod tests {
         };
         let encoded = aggregate.abi_encode();
 
-        // Should have the aggregate3 selector (4 bytes) plus encoded data
         assert!(encoded.len() > 4);
-        // Reasonable size: selector(4) + offset(32) + length(32) + at least one Call3 struct
         assert!(encoded.len() > 100, "encoded aggregate3 should be a reasonable size, got {} bytes", encoded.len());
     }
 
@@ -327,7 +497,6 @@ mod tests {
         };
         let encoded = aggregate.abi_encode();
 
-        // With two calls, encoded data should be larger than with one
         let single_meta = sample_metadata();
         let single_call = build_transfer_call3(&single_meta, true);
         let single_aggregate = IMulticall3::aggregate3Call {
@@ -356,7 +525,6 @@ mod tests {
         };
         let encoded = aggregate.abi_encode();
 
-        // Decode and verify
         let decoded = IMulticall3::aggregate3Call::abi_decode(&encoded)
             .expect("should decode aggregate3 calldata");
         assert_eq!(decoded.calls.len(), 1);
