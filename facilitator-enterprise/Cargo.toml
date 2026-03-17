@@ -49,3 +49,4 @@ alloy = { version = "1.6", features = ["dyn-abi", "providers", "rpc-types", "sol
 alloy-primitives = { workspace = true }
 alloy-sol-types = { version = "1.4" }
 thiserror = { workspace = true }
+subtle = "2"

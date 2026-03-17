@@ -65,7 +65,7 @@ impl TransportState {
         if self.consecutive_failures.load(Ordering::Relaxed) < threshold {
             return true;
         }
-        match *self.circuit_opened_at.read().unwrap() {
+        match *self.circuit_opened_at.read().unwrap_or_else(|e| e.into_inner()) {
             Some(opened_at) => opened_at.elapsed() >= cooldown,
             None => true,
         }
@@ -73,7 +73,7 @@ impl TransportState {
 
     fn record_success(&self) {
         self.consecutive_failures.store(0, Ordering::Relaxed);
-        *self.circuit_opened_at.write().unwrap() = None;
+        *self.circuit_opened_at.write().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Record a transport-level failure. Opens circuit after `threshold` consecutive failures.
@@ -83,7 +83,7 @@ impl TransportState {
         }
         let prev = self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
         if prev + 1 >= threshold {
-            *self.circuit_opened_at.write().unwrap() = Some(Instant::now());
+            *self.circuit_opened_at.write().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         }
     }
 }

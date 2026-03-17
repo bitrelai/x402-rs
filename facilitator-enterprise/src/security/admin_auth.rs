@@ -4,6 +4,12 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use subtle::ConstantTimeEq;
+
+/// Constant-time string comparison to prevent timing side-channel attacks.
+fn ct_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.as_bytes().ct_eq(b.as_bytes()).into()
+}
 
 #[derive(Clone, Debug)]
 pub struct AdminAuth {
@@ -39,7 +45,7 @@ impl AdminAuth {
             .and_then(|v| v.to_str().ok());
 
         match provided_key {
-            Some(key) if key == configured_key => next.run(req).await,
+            Some(key) if ct_eq(key, configured_key) => next.run(req).await,
             Some(_) => {
                 tracing::warn!("Admin endpoint accessed with invalid key");
                 (StatusCode::UNAUTHORIZED, "Invalid admin key").into_response()

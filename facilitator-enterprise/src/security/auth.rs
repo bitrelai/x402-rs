@@ -4,12 +4,12 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use std::collections::HashSet;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 
 #[derive(Clone)]
 pub struct ApiKeyAuth {
-    api_keys: Arc<HashSet<String>>,
+    api_keys: Arc<Vec<String>>,
     log_events: bool,
 }
 
@@ -21,7 +21,7 @@ impl ApiKeyAuth {
                 keys.split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
-                    .collect::<HashSet<_>>()
+                    .collect::<Vec<_>>()
             })
             .unwrap_or_default();
 
@@ -69,7 +69,12 @@ impl ApiKeyAuth {
             .strip_prefix("Bearer ")
             .ok_or("Invalid Authorization header format (expected 'Bearer <token>')")?;
 
-        if self.api_keys.contains(token) {
+        let token_bytes = token.as_bytes();
+        if self
+            .api_keys
+            .iter()
+            .any(|k| k.len() == token.len() && k.as_bytes().ct_eq(token_bytes).into())
+        {
             Ok(())
         } else {
             Err("Invalid API key".to_string())
@@ -84,8 +89,7 @@ mod tests {
 
     #[test]
     fn test_valid_api_key() {
-        let mut api_keys = HashSet::new();
-        api_keys.insert("test-key-123".to_string());
+        let api_keys = vec!["test-key-123".to_string()];
 
         let auth = ApiKeyAuth {
             api_keys: Arc::new(api_keys),
@@ -103,8 +107,7 @@ mod tests {
 
     #[test]
     fn test_invalid_api_key() {
-        let mut api_keys = HashSet::new();
-        api_keys.insert("test-key-123".to_string());
+        let api_keys = vec!["test-key-123".to_string()];
 
         let auth = ApiKeyAuth {
             api_keys: Arc::new(api_keys),
@@ -122,8 +125,7 @@ mod tests {
 
     #[test]
     fn test_missing_bearer_prefix() {
-        let mut api_keys = HashSet::new();
-        api_keys.insert("test-key-123".to_string());
+        let api_keys = vec!["test-key-123".to_string()];
 
         let auth = ApiKeyAuth {
             api_keys: Arc::new(api_keys),
