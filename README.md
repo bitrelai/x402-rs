@@ -27,9 +27,12 @@ x402-rs is a modular, production-ready implementation of the x402 protocol with 
 
 ### Deployment
 
-| Crate                                   | Description                                                             |
-|-----------------------------------------|-------------------------------------------------------------------------|
-| **[`x402-facilitator`](./facilitator)** | Production-ready facilitator server binary (not published to crates.io) |
+| Crate                                                        | Description                                                                                       |
+|--------------------------------------------------------------|---------------------------------------------------------------------------------------------------|
+| **[`x402-facilitator`](./facilitator)**                      | Production-ready facilitator server binary (not published to crates.io)                           |
+| **[`facilitator-enterprise`](./facilitator-enterprise)**     | Enterprise facilitator with security middleware, batch settlement, hooks, and token filtering      |
+
+The `facilitator-enterprise` crate wraps the upstream facilitator with production-hardening features originally developed in the [infra402-facilitator](https://github.com/infra402/infra402-facilitator) project. See the [facilitator-enterprise README](./facilitator-enterprise/README.md) for details.
 
 ## About x402
 
