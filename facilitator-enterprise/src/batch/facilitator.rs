@@ -74,13 +74,29 @@ fn extract_chain_id(request: &proto::SettleRequest) -> Option<ChainId> {
     request.scheme_handler_slug().map(|slug| slug.chain_id)
 }
 
+/// EIP-6492 magic suffix (32 bytes). Signatures ending with this are EIP-6492 wrapped.
+const EIP6492_MAGIC_SUFFIX: [u8; 32] = [
+    0x64, 0x92, 0x64, 0x92, 0x64, 0x92, 0x64, 0x92, 0x64, 0x92, 0x64, 0x92, 0x64, 0x92, 0x64,
+    0x92, 0x64, 0x92, 0x64, 0x92, 0x64, 0x92, 0x64, 0x92, 0x64, 0x92, 0x64, 0x92, 0x64, 0x92,
+    0x64, 0x92,
+];
+
+/// Check if a signature is EIP-6492 wrapped (ends with magic suffix).
+fn is_eip6492_signature(sig: &[u8]) -> bool {
+    sig.len() > 32 && sig[sig.len() - 32..] == EIP6492_MAGIC_SUFFIX
+}
+
 /// Extract EIP-3009 settlement metadata from a raw SettleRequest JSON.
 ///
 /// Handles both v1 and v2 payload formats:
 /// - V2: `paymentPayload.authorization.*`, `paymentPayload.accepted.asset`, `paymentPayload.signature`
 /// - V1: `paymentPayload.payload.authorization.*`, `paymentRequirements.asset`, `paymentPayload.payload.signature`
 ///
-/// Returns None if the payload doesn't contain EIP-3009 authorization data.
+/// Returns None if:
+/// - The payload doesn't contain EIP-3009 authorization data (Permit2, upto, etc.)
+/// - The signature is EIP-6492 wrapped (contains factory deployment data that the
+///   batch path cannot handle — must fall back to upstream direct settlement)
+/// - Any required field is missing or malformed
 fn extract_eip3009_metadata(request: &proto::SettleRequest) -> Option<SettlementMetadata> {
     use alloy::primitives::{Address, Bytes, FixedBytes};
 
@@ -116,6 +132,14 @@ fn extract_eip3009_metadata(request: &proto::SettleRequest) -> Option<Settlement
 
     let signature_str = signature_obj.get("signature")?.as_str()?;
     let signature: Bytes = signature_str.parse().ok()?;
+
+    // Reject EIP-6492 wrapped signatures — they contain factory deployment data
+    // that the batch path cannot handle. These must go through upstream direct
+    // settlement which has full EIP-6492 support.
+    if is_eip6492_signature(&signature) {
+        tracing::debug!("EIP-6492 signature detected — not batchable");
+        return None;
+    }
 
     let contract_address: Address = asset_str.parse().ok()?;
 
@@ -422,7 +446,7 @@ mod tests {
 
     #[test]
     fn extract_eip3009_metadata_v2_success() {
-        use alloy::primitives::{address, Address};
+        use alloy::primitives::Address;
 
         let json = r#"{
             "x402Version": 2,
@@ -620,5 +644,65 @@ mod tests {
 
         let request = make_request(json);
         assert!(extract_eip3009_metadata(&request).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // EIP-6492 signature detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_eip6492_signature_detects_magic_suffix() {
+        // Build a signature that ends with the EIP-6492 magic suffix
+        let mut sig = vec![0xaa; 65]; // normal sig bytes
+        sig.extend_from_slice(&EIP6492_MAGIC_SUFFIX);
+        assert!(is_eip6492_signature(&sig));
+    }
+
+    #[test]
+    fn is_eip6492_signature_rejects_normal_signature() {
+        let sig = vec![0xaa; 65]; // normal 65-byte EOA signature
+        assert!(!is_eip6492_signature(&sig));
+    }
+
+    #[test]
+    fn is_eip6492_signature_rejects_short_signature() {
+        let sig = EIP6492_MAGIC_SUFFIX.to_vec(); // exactly 32 bytes = too short
+        assert!(!is_eip6492_signature(&sig));
+    }
+
+    #[test]
+    fn extract_eip3009_metadata_rejects_eip6492_wrapped_v2() {
+        // Build a hex signature string that ends with the EIP-6492 magic suffix
+        let mut sig_bytes = vec![0xaa; 65];
+        sig_bytes.extend_from_slice(&EIP6492_MAGIC_SUFFIX);
+        let sig_hex = format!("0x{}", alloy::hex::encode(&sig_bytes));
+
+        let json = format!(r#"{{
+            "x402Version": 2,
+            "paymentPayload": {{
+                "accepted": {{
+                    "network": "eip155:84532",
+                    "scheme": "exact",
+                    "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+                    "amount": "1000000"
+                }},
+                "authorization": {{
+                    "from": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "to": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "value": "1000000",
+                    "validAfter": "0",
+                    "validBefore": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+                    "nonce": "0x0000000000000000000000000000000000000000000000000000000000000001"
+                }},
+                "signature": "{sig_hex}"
+            }}
+        }}"#);
+
+        let request = make_request(&json);
+        // Should return None because of EIP-6492 magic suffix
+        assert!(
+            extract_eip3009_metadata(&request).is_none(),
+            "EIP-6492 wrapped signature should cause metadata extraction to return None"
+        );
     }
 }
