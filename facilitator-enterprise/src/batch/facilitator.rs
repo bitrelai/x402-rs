@@ -174,7 +174,21 @@ impl Facilitator for BatchFacilitator {
                 let network_name = chain_id_to_network_name(&chain_id);
 
                 if chain_id.namespace() == "eip155" && batch_queue.should_batch(&network_name) {
-                    // Verify first
+                    // Try to extract EIP-3009 metadata. If extraction fails (Permit2,
+                    // upto, EIP-6492 wrapped, or unrecognized scheme), fall back to
+                    // upstream direct settlement instead of erroring.
+                    let metadata = match extract_eip3009_metadata(request) {
+                        Some(m) => m,
+                        None => {
+                            tracing::debug!(
+                                network = %network_name,
+                                "Request is not EIP-3009 exact — falling back to direct settlement"
+                            );
+                            return self.inner.settle(request).await.map_err(Into::into);
+                        }
+                    };
+
+                    // Verify before enqueueing
                     let verify_response = self.inner.verify(request).await?;
                     let is_valid = verify_response
                         .0
@@ -187,13 +201,6 @@ impl Facilitator for BatchFacilitator {
                             "Verification failed before batch enqueue".into(),
                         ));
                     }
-
-                    // Extract metadata
-                    let metadata = extract_eip3009_metadata(request).ok_or_else(|| {
-                        BatchFacilitatorError::Batch(
-                            "Failed to extract EIP-3009 metadata from request".into(),
-                        )
-                    })?;
 
                     // Get the EVM provider for this chain
                     let provider =
